@@ -1,0 +1,34 @@
+# Private project brief and orchestration state
+BRIEF.md
+STATE.md
+research/
+plans/
+inboxes/
+log/
+review/
+
+# Research workflow and provider artifacts
+nlm/profile
+nlm/questions.json
+nlm/notebooks.json
+nlm/responses/
+nlm/scripts/
+*.done
+*.err
+*.partial
+*.rejected
+*.failed
+*.lock
+
+# Generated data, caches, and local runtime outputs
+caches/
+data/cache/
+data/raw/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+.venv/
+htmlcov/
+.coverage

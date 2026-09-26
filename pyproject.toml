@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robust-speech-command-study"
+version = "0.1.0"
+description = "Deterministic foundations for robust speech command evaluation"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.23",
+    "torch",
+    "torchaudio",
+    "matplotlib",
+    "nbformat",
+    "nbclient",
+    "pytest",
+]
+
+[tool.setuptools]
+packages = ["src"]
