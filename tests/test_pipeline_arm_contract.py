@@ -158,7 +158,12 @@ def test_training_forward_passes_see_exactly_the_train_split_once_per_epoch(bund
     for name in ("train", "val", "cal", "test"):
         f = log_mel(torch.from_numpy(_float(sp[name].waveforms)))
         pool.append(f.flatten(1)); owner += [name] * f.shape[0]
-    dist = torch.cdist(seen.flatten(1), torch.cat(pool))
+    # The matrix-multiplication cdist path suffers cancellation on these
+    # high-dimensional log-mel rows: identical rows can appear ~7e-2 apart.
+    # Use direct Euclidean accumulation so this remains a provenance oracle.
+    dist = torch.cdist(
+        seen.flatten(1), torch.cat(pool), compute_mode="donot_use_mm_for_euclid_dist"
+    )
     nearest = dist.argmin(dim=1)
     assert dist.min(dim=1).values.max() < 1e-3, "a training row matches no clip of the bundle"
     assert {owner[i] for i in nearest.tolist()} == {"train"}
