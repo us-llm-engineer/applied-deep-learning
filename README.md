@@ -1,6 +1,6 @@
 # Robust speech command study
 
-This repository provides deterministic data, audio-shift, cache, calibration, and paired-evaluation foundations for a compact Speech Commands robustness study. The current notebooks use local synthetic fallbacks to make the workflow reviewable without downloading audio or fitting a model; their metrics are demonstrations, not research results.
+This repository provides deterministic data, audio-shift, cache, calibration, and paired-evaluation foundations for a compact Speech Commands robustness study. The current notebooks use local synthetic fallbacks to make the setup reviewable without downloading audio or fitting a model; their metrics are demonstrations, not research results.
 
 ## Run locally
 

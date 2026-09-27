@@ -4,6 +4,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import math
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import NamedTuple
@@ -19,6 +20,45 @@ from .dataset import (
 
 
 CLIP = 16_000  # 16,000 samples for 1-second audio at 16 kHz
+
+_SPEAKER_ID = re.compile(r"([0-9a-f]{8})_nohash_[0-9]+(?:\.wav)?\Z")
+
+
+def speaker_of(identifier: str) -> str | None:
+    """Return the source speaker token from a Speech Commands filename ID."""
+    # IDs may be relative paths (or platform-style paths); only the final
+    # filename is meaningful, and its complete stem must match the convention.
+    filename = str(identifier).replace("\\", "/").rsplit("/", 1)[-1]
+    match = _SPEAKER_ID.fullmatch(filename)
+    return match.group(1) if match else None
+
+
+def speakers_per_split(bundle: DatasetBundle) -> dict[str, int]:
+    """Count distinct parseable source speakers in each split."""
+    return {
+        name: len({speaker for identifier in split.ids if (speaker := speaker_of(identifier)) is not None})
+        for name, split in bundle.splits.items()
+    }
+
+
+def speaker_overlap(bundle: DatasetBundle) -> dict[str, float]:
+    """Fraction of test rows whose source speaker also occurs in a reference split."""
+    test = bundle.splits.get("test")
+    train = bundle.splits.get("train")
+    cal = bundle.splits.get("cal")
+    if test is None or not test.ids:
+        return {"test_seen_in_train": 0.0, "test_seen_in_cal": 0.0}
+
+    test_speakers = [speaker_of(identifier) for identifier in test.ids]
+    denominator = len(test.ids)
+
+    def fraction(reference: SplitArrays | None) -> float:
+        if reference is None:
+            return 0.0
+        reference_speakers = {speaker for identifier in reference.ids if (speaker := speaker_of(identifier)) is not None}
+        return sum(speaker is not None and speaker in reference_speakers for speaker in test_speakers) / denominator
+
+    return {"test_seen_in_train": fraction(train), "test_seen_in_cal": fraction(cal)}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,8 +112,8 @@ def assemble_bundle(
         noise_arrays.append(data.astype(np.int16))
 
     # Collect command and train-unknown clips
-    command_records = {}  # word -> list of (clip_id, word, audio, checksum)
-    unknown_records = []  # list of (clip_id, word, audio, checksum)
+    command_records = {}  # word -> list of (clip_id, word, audio, checksum, source_path)
+    unknown_records = []  # list of (clip_id, word, audio, checksum, source_path)
     heldout_clips = []  # separate storage for OOD
     record_ids = {}  # map from id to (word, audio)
 
@@ -99,22 +139,23 @@ def assemble_bundle(
                 audio = audio[:CLIP]
 
             # Generate unique id
-            clip_id = f"{word}_{wav_file.stem.split('_')[-1]}"
+            clip_id = f"{word}/{wav_file.name}"
+            source_path = wav_file
             checksum = hashlib.sha256(audio.tobytes()).hexdigest()
 
             if word in commands:
                 # Command word
                 if word not in command_records:
                     command_records[word] = []
-                command_records[word].append((clip_id, word, audio, checksum))
+                command_records[word].append((clip_id, word, audio, checksum, source_path))
                 record_ids[clip_id] = (word, audio)
             elif word in train_unknown_words:
                 # Train-unknown word
-                unknown_records.append((clip_id, word, audio, checksum))
+                unknown_records.append((clip_id, word, audio, checksum, source_path))
                 record_ids[clip_id] = (word, audio)
             else:
                 # Heldout word
-                heldout_clips.append((clip_id, word, audio, checksum))
+                heldout_clips.append((clip_id, word, audio, checksum, source_path))
 
     # Track shortfalls for each command
     shortfalls = {}
@@ -131,16 +172,16 @@ def assemble_bundle(
             shortfalls[cmd] = cap_per_label - len(clips)
         elif len(clips) > cap_per_label:
             # Sample deterministically
-            word_seed = hash((seed, cmd)) & 0x7fffffff
+            word_seed = int.from_bytes(hashlib.sha256(f"{seed}:{cmd}".encode()).digest()[:4], "little")
             rng = np.random.default_rng(word_seed)
             indices = rng.choice(len(clips), cap_per_label, replace=False)
             clips = [clips[int(i)] for i in sorted(indices)]
 
-        for clip_id, word, audio, checksum in clips:
+        for clip_id, word, audio, checksum, source_path in clips:
             indist_records.append(AudioRecord(
                 identifier=clip_id,
                 label=cmd,
-                path=dataset_root / cmd / f"{word}_{clip_id.split('_')[-1]}.wav",
+                path=source_path,
                 checksum=checksum,
                 sample_rate=16000,
                 num_frames=CLIP
@@ -150,8 +191,8 @@ def assemble_bundle(
     if unknown_records:
         # Group by word
         unknown_by_word = defaultdict(list)
-        for clip_id, word, audio, checksum in unknown_records:
-            unknown_by_word[word].append((clip_id, audio, checksum))
+        for clip_id, word, audio, checksum, source_path in unknown_records:
+            unknown_by_word[word].append((clip_id, audio, checksum, source_path))
 
         # Determine target clips per word
         n_words = len(unknown_by_word)
@@ -168,16 +209,16 @@ def assemble_bundle(
                 selected = clips
             else:
                 # Sample
-                word_seed = hash((seed, word)) & 0x7fffffff
+                word_seed = int.from_bytes(hashlib.sha256(f"{seed}:{word}".encode()).digest()[:4], "little")
                 word_rng = np.random.default_rng(word_seed)
                 indices = word_rng.choice(len(clips), n_clips, replace=False)
                 selected = [clips[int(idx)] for idx in sorted(indices)]
 
-            for clip_id, audio, checksum in selected:
+            for clip_id, audio, checksum, source_path in selected:
                 indist_records.append(AudioRecord(
                     identifier=clip_id,
                     label="unknown",
-                    path=dataset_root / word / f"{clip_id.split('_')[-1]}.wav",
+                    path=source_path,
                     checksum=checksum,
                     sample_rate=16000,
                     num_frames=CLIP
@@ -303,8 +344,8 @@ def assemble_bundle(
     rng = np.random.default_rng(seed)
 
     heldout_by_word = defaultdict(list)
-    for clip_id, word, audio, checksum in heldout_clips:
-        heldout_by_word[word].append((clip_id, audio))
+    for clip_id, word, audio, checksum, source_path in heldout_clips:
+        heldout_by_word[word].append((clip_id, audio, source_path))
 
     ood_ids = []
     ood_words = []
@@ -317,11 +358,11 @@ def assemble_bundle(
             continue
         n_clips = clips_per_word + (1 if i < remainder else 0)
         clips = heldout_by_word[word]
-        word_seed = hash((seed, word)) & 0x7fffffff
+        word_seed = int.from_bytes(hashlib.sha256(f"{seed}:{word}".encode()).digest()[:4], "little")
         word_rng = np.random.default_rng(word_seed)
         indices = word_rng.choice(len(clips), min(n_clips, len(clips)), replace=False)
         for idx in sorted(indices):
-            clip_id, audio = clips[int(idx)]
+            clip_id, audio, source_path = clips[int(idx)]
             ood_ids.append(clip_id)
             ood_words.append(word)
             ood_waveforms.append(audio)
@@ -390,5 +431,7 @@ def audit_bundle(bundle: DatasetBundle) -> dict:
         "duplicate_checksums": duplicate_checksums,
         "heldout_word_leak": heldout_word_leak,
         "silence_time_overlap": silence_time_overlap,
-        "label_counts": label_counts
+        "label_counts": label_counts,
+        "speakers_per_split": speakers_per_split(bundle),
+        "speaker_overlap": speaker_overlap(bundle),
     }

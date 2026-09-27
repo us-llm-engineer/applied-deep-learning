@@ -341,7 +341,7 @@ def cells():
 
         $$s_{\\max}(x) = \\max_k p_k, \\qquad s_{\\text{doctor}}(x) = 1 - \\frac{1}{\\sum_k p_k^2}, \\qquad s_{\\text{ent}}(x) = \\sum_k p_k \\log p_k = -H(p).$$
 
-        **Provenance.** These are the three softmax-response scores of Eq. (7) as printed in the paper (L p.4): max-softmax, the DOCTOR score $1 - 1/\\lVert p\\rVert_2^2$, and the negative entropy $\\sum_k p_k \\log p_k$; each is oriented so that a larger value means more confident. The DOCTOR score is a strictly increasing function of $\\sum_k p_k^2$, so wherever the code below ranks by $\\sum_k p_k^2$ the ordering (and hence the risk-coverage curve) is identical. A risk-coverage curve depends only on the ordering of the scores, so any strictly increasing transform of these forms gives the same curve; the exact typeset expression should still be checked against the paper before it is quoted. The top-two probability gap $p_{(1)} - p_{(2)}$ is a different score and is not used here.
+        **Provenance.** These are the three softmax-response scores of Eq. (7) as printed in the paper (L p.4): max-softmax, the DOCTOR score $1 - 1/\\lVert p\\rVert_2^2$, and the negative entropy $\\sum_k p_k \\log p_k$; each is oriented so that a larger value means more confident. The DOCTOR score is a strictly increasing function of $\\sum_k p_k^2$, so ranking by that explicitly named order key gives the same ordering (and risk-coverage curve) as ranking by the displayed DOCTOR score. A risk-coverage curve depends only on the ordering of the scores, so any strictly increasing transform of these forms gives the same curve. The top-two probability gap $p_{(1)} - p_{(2)}$ is a different score and is not used here.
 
         Multiplying the logits by a scale $\\lambda > 0$ changes the softmax output:
 
@@ -363,11 +363,11 @@ def cells():
 
         ### What we derive and test here (derived here)
 
-        Write $d_k = z_{(1)} - z_{(k)} \\ge 0$ for $k = 2, \\dots, K$ (so $d_2$ is the confidence margin) and $S_\\lambda = \\sum_{k \\ge 2} e^{-\\lambda d_k}$. Then $p_{(1)} = 1/(1+S_\\lambda)$ and $p_{(k)} = e^{-\\lambda d_k}/(1+S_\\lambda)$. In floating point $p_{(1)}$ rounds to exactly 1 once $S_\\lambda < 10^{-16}$, which would create ties that are an artefact of arithmetic. So the three scores are computed through their **complements**, which stay finite:
+        Write $d_k = z_{(1)} - z_{(k)} \\ge 0$ for $k = 2, \\dots, K$ (so $d_2$ is the confidence margin) and $S_\\lambda = \\sum_{k \\ge 2} e^{-\\lambda d_k}$. Then $p_{(1)} = 1/(1+S_\\lambda)$ and $p_{(k)} = e^{-\\lambda d_k}/(1+S_\\lambda)$. In floating point $p_{(1)}$ rounds to exactly 1 once $S_\\lambda < 10^{-16}$, so the displayed $s_{\\max}=p_{(1)}$ rounds to 1 and creates ties. We therefore keep $\\log(1-s_{\\max})$ as a log-domain complement, used only to recover the actual score or preserve its ranking. For entropy the log-domain quantity is likewise a log-complement; for DOCTOR we use the explicitly named $\\text{doctor\\_order\\_key}=-\\log\\sum_k p_k^2$. This key decreases strictly as the displayed DOCTOR score $s_{\\text{doctor}}=1-1/\\sum_k p_k^2$ increases, so its negation gives the same descending ranking, including at high logit scales.
 
-        $$1 - s_{\\max} = \\frac{S_\\lambda}{1+S_\\lambda}, \\qquad 1 - s_{\\text{doctor}} = \\frac{2S_\\lambda + X_\\lambda}{(1+S_\\lambda)^2}, \\qquad H = \\log(1+S_\\lambda) + \\frac{\\lambda \\sum_{k\\ge2} d_k e^{-\\lambda d_k}}{1+S_\\lambda}.$$
+        $$1 - s_{\\max} = \\frac{S_\\lambda}{1+S_\\lambda}, \\qquad \\sum_k p_k^2 = \\frac{1+Q_\\lambda}{(1+S_\\lambda)^2}, \\qquad H = \\log(1+S_\\lambda) + \\frac{\\lambda \\sum_{k\\ge2} d_k e^{-\\lambda d_k}}{1+S_\\lambda}.$$
 
-        For the middle formula, $\\sum_k p_k^2 = (1 + Q_\\lambda)/(1+S_\\lambda)^2$ with $Q_\\lambda = \\sum_{k\\ge2} e^{-2\\lambda d_k}$, and $(1+S_\\lambda)^2 - 1 - Q_\\lambda = 2 S_\\lambda + (S_\\lambda^2 - Q_\\lambda) = 2S_\\lambda + X_\\lambda$ with $X_\\lambda = 2\\sum_{2 \\le j < k} e^{-\\lambda(d_j + d_k)}$. For the entropy, $-\\sum_k p_k \\log p_k = \\sum_k p_k(\\lambda d_k + \\log(1+S_\\lambda))$ with $d_1 = 0$. All logarithms of these positive quantities are evaluated with log-sum-exp, and each SR score is the negative of its log-complement, a strictly increasing map, so the ordering is unchanged.
+        Here $Q_\\lambda = \\sum_{k\\ge2} e^{-2\\lambda d_k}$, and therefore $\\text{doctor\\_order\\_key}=2\\log(1+S_\\lambda)-\\log(1+Q_\\lambda)$. Since $s_{\\text{doctor}}=1-\\exp(\\text{doctor\\_order\\_key})$, decreasing the key strictly increases the actual score. For entropy, $-\\sum_k p_k \\log p_k = \\sum_k p_k(\\lambda d_k + \\log(1+S_\\lambda))$ with $d_1 = 0$. The log-domain keys avoid rounding ties while preserving the displayed-score ranking.
 
         **A bound for $s_{\\max}$.** Since $S_\\lambda = e^{-\\lambda d_2}\\bigl(1 + \\sum_{k\\ge3} e^{-\\lambda(d_k - d_2)}\\bigr)$ and $d_k \\ge d_2$ for $k \\ge 3$, the log-complement satisfies
 
@@ -375,7 +375,7 @@ def cells():
 
         Hence if two examples have margins with $\\lambda\\,(d_2(x) - d_2(x')) > \\log(K-1)$, then $x$ outranks $x'$ under $s_{\\max}$ too. Rank disagreement with the margin can therefore only occur among pairs whose margins differ by less than $\\log(K-1)/\\lambda$: for $K = 4$ and $\\lambda = 100$ that window is $\\log 3 / 100 \\approx 0.011$ in margin units. This is a worked example of why the ordering must converge. It is proved here only for $s_{\\max}$; for $s_{\\text{doctor}}$ and $s_{\\text{ent}}$ the leading term is also a monotone function of $\\lambda d_2$, but this study checks that numerically rather than proving it.
 
-        **What would make the toy conclusion wrong:** the check below would fail if the complement formulas had an algebra error (they are compared against direct softmax arithmetic where that is accurate), or if the bound above were violated by any pair of examples.
+        **What would make the toy conclusion wrong:** the checks below would fail if the log-domain score keys disagreed with their displayed scores where direct arithmetic is accurate, if the DOCTOR order-key relationship failed, or if the bound above were violated by any pair of examples.
         """),
 
         code("""
@@ -413,50 +413,68 @@ def cells():
         """),
 
         code("""
-        # S4.2: SR scores via log-complements, validated against direct softmax arithmetic. Test logits from S4.1, no randomness.
+        # S4.2: Stable SR ranking keys, validated against displayed softmax scores where direct arithmetic is accurate.
         def s_gaps4(z):
             zs = -np.sort(-z, axis=1)
             return zs[:, :1] - zs[:, 1:]  # d_k = z(1) - z(k), k = 2..K; column 0 is the confidence margin.
 
-        def s_log_complement4(z, lam):
-            # Returns log of (1 - s_max), (1 - s_doctor), H at logit scale lam; scores are the negatives (monotone).
+        def s_log_keys4(z, lam):
+            # Returns log(1 - actual SR_max), a stable DOCTOR confidence key, and log(H).
             D = lam * s_gaps4(z)
             logS = logsumexp(-D, axis=1)
             l1pS = np.log1p(np.exp(logS))  # log(1 + S)
             l_max = logS - l1pS
-            pairs = [-(D[:, j] + D[:, k]) for j in range(D.shape[1]) for k in range(j + 1, D.shape[1])]
-            logX = np.log(2.0) + logsumexp(np.stack(pairs, axis=1), axis=1)
-            l_doc = np.logaddexp(np.log(2.0) + logS, logX) - 2.0 * l1pS
+            logQ = logsumexp(-2.0 * D, axis=1)
+            # -s_doctor = R / (1 + Q), R = 2S + (S² - Q).
+            # Evaluate log(S²-Q) from distinct pairs to avoid cancellation at large lambda.
+            s_pair_i4, s_pair_j4 = np.triu_indices(D.shape[1], k=1)
+            if len(s_pair_i4):
+                logX = np.log(2.0) + logsumexp(-D[:, s_pair_i4] - D[:, s_pair_j4], axis=1)
+            else:
+                logX = np.full(len(D), -np.inf)
+            logR = np.logaddexp(np.log(2.0) + logS, logX)
+            doctor_log_magnitude = logR - np.logaddexp(0.0, logQ)
+            doctor_order_key = -doctor_log_magnitude
             logT = logsumexp(-D + np.log(np.maximum(D, 1e-300)), axis=1)
             l_log1p = np.where(logS < -30, logS, np.log(np.maximum(l1pS, 1e-300)))
             l_ent = np.logaddexp(l_log1p, logT - l1pS)
-            return {"SR_max": l_max, "SR_doctor": l_doc, "SR_ent": l_ent}
+            return {"SR_max": l_max, "doctor_order_key": doctor_order_key,
+                    "doctor_log_magnitude": doctor_log_magnitude, "SR_ent": l_ent}
 
         def s_direct4(z, lam):
             a = lam * z
             a = a - a.max(axis=1, keepdims=True)
             p = np.exp(a)
             p /= p.sum(axis=1, keepdims=True)
-            return {"SR_max": 1 - p.max(axis=1), "SR_doctor": 1 - (p ** 2).sum(axis=1),
-                    "SR_ent": -(p * np.log(np.clip(p, 1e-300, 1))).sum(axis=1)}
+            return {"SR_max": p.max(axis=1), "SR_doctor": 1 - 1.0 / (p ** 2).sum(axis=1),
+                    "SR_ent": (p * np.log(np.clip(p, 1e-300, 1))).sum(axis=1)}
 
         s_lam_val4 = 0.5
-        s_lc4 = s_log_complement4(s_zte4, s_lam_val4)
+        s_lc4 = s_log_keys4(s_zte4, s_lam_val4)
         s_dr4 = s_direct4(s_zte4, s_lam_val4)
         s_rel_err4 = {}
-        for s_name in s_lc4:
-            s_ok = s_dr4[s_name] > 1e-9  # direct arithmetic is only accurate where the complement is not tiny
-            s_rel_err4[s_name] = float(np.max(np.abs(np.exp(s_lc4[s_name][s_ok]) - s_dr4[s_name][s_ok]) / s_dr4[s_name][s_ok]))
+        s_stable4 = {"SR_max": -np.expm1(s_lc4["SR_max"]),
+                     "SR_doctor": -np.exp(s_lc4["doctor_log_magnitude"]),
+                     "SR_ent": -np.exp(s_lc4["SR_ent"])}
+        s_key_for_rc4 = lambda vals, name: vals["doctor_order_key"] if name == "SR_doctor" else -vals[name]
+        for s_name in s_dr4:
+            s_ok = np.abs(s_dr4[s_name]) > 1e-9
+            s_rel_err4[s_name] = float(np.max(np.abs(s_stable4[s_name][s_ok] - s_dr4[s_name][s_ok]) / np.abs(s_dr4[s_name][s_ok])))
             check(f"S4.2-{s_name}", s_rel_err4[s_name] < 1e-8 and s_ok.mean() > 0.99,
-                  f"log-complement vs direct softmax at lambda={s_lam_val4}: max rel. error {s_rel_err4[s_name]:.1e} on {s_ok.mean():.1%} of rows (< 1e-8)")
+                  f"stable log-domain score vs direct displayed score at lambda={s_lam_val4}: max rel. error {s_rel_err4[s_name]:.1e} on {s_ok.mean():.1%} of rows (< 1e-8)")
+        s_doc_key4 = s_lc4["doctor_order_key"]
+        s_doctor_from_key4 = -np.exp(-s_doc_key4)
+        s_doc_order_ok4 = np.array_equal(np.argsort(s_doctor_from_key4), np.argsort(s_doc_key4))
+        check("S4.2-doctor-order", s_doc_order_ok4 and np.allclose(s_doctor_from_key4, s_stable4["SR_doctor"], atol=0, rtol=0),
+              f"doctor_order_key=-log(-s_doctor) ranks actual s_doctor=-exp(-doctor_order_key) identically at lambda={s_lam_val4}")
 
         s_lam_grid4 = np.array([0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0])
-        s_keys4 = {lam: s_log_complement4(s_zte4, lam) for lam in s_lam_grid4}
+        s_keys4 = {lam: s_log_keys4(s_zte4, lam) for lam in s_lam_grid4}
         s_margin4 = s_gaps4(s_zte4)[:, 0]
-        # At lambda=1000 the direct formula rounds SR_max to exactly 1 for many rows; the log-complement does not.
+        # At lambda=1000 the direct displayed SR_max rounds to exactly 1 for many rows; the log-complement key preserves its ordering.
         s_direct_big = s_direct4(s_zte4, 1000.0)["SR_max"]
-        print(f"At lambda=1000, direct 1-SR_max is exactly 0 for {np.mean(s_direct_big == 0):.1%} of rows (ties from rounding);")
-        print(f"the log-complement has {len(np.unique(s_keys4[1000.0]['SR_max']))} distinct values out of {len(s_margin4)}.")
+        print(f"At lambda=1000, direct SR_max rounds to exactly 1 for {np.mean(s_direct_big == 1):.1%} of rows (ties from rounding);")
+        print(f"the log-domain log-complement key, used to recover/rank actual SR_max, has {len(np.unique(s_keys4[1000.0]['SR_max']))} distinct values out of {len(s_margin4)}.")
         """),
 
         code("""
@@ -470,8 +488,8 @@ def cells():
             return 1.0 / (1.0 + np.exp(-lam * d).sum())
         s_ha1, s_hb1 = s_hand_srmax(s_row_a, 1.0), s_hand_srmax(s_row_b, 1.0)
         s_ha10, s_hb10 = s_hand_srmax(s_row_a, 10.0), s_hand_srmax(s_row_b, 10.0)
-        s_la10 = -s_log_complement4(s_row_a, 10.0)["SR_max"][0]
-        s_lb10 = -s_log_complement4(s_row_b, 10.0)["SR_max"][0]
+        s_la10 = -s_log_keys4(s_row_a, 10.0)["SR_max"][0]
+        s_lb10 = -s_log_keys4(s_row_b, 10.0)["SR_max"][0]
 
         check("S4.2b-flip", s_marg_b > s_marg_a and s_ha1 > s_hb1,
               f"lambda=1: margin(b)={s_marg_b:.1f} > margin(a)={s_marg_a:.1f} but SR_max(a)={s_ha1:.4f} > SR_max(b)={s_hb1:.4f} (orders disagree)")
@@ -489,7 +507,7 @@ def cells():
         s_risk_srmax4 = []
         for lam in s_lam_grid4:
             for name in s_aurc_sr4:
-                s_aurc_sr4[name].append(aurc(*risk_coverage_curve(-s_keys4[lam][name], s_correct4)))
+                s_aurc_sr4[name].append(aurc(*risk_coverage_curve(s_key_for_rc4(s_keys4[lam], name), s_correct4)))
             s_cov_m, s_risk_m = risk_coverage_curve(lam * s_margin4, s_correct4)  # margin score at scale lambda
             s_risk_margin4.append(s_risk_m)
             s_aurc_margin4.append(aurc(s_cov_m, s_risk_m))
@@ -517,7 +535,7 @@ def cells():
         s_rho4 = {name: [] for name in ["SR_max", "SR_doctor", "SR_ent"]}
         for lam in s_lam_grid4:
             for name in s_rho4:
-                s_rho4[name].append(float(spearmanr(-s_keys4[lam][name], s_margin4)[0]))
+                s_rho4[name].append(float(spearmanr(s_key_for_rc4(s_keys4[lam], name), s_margin4)[0]))
 
         s_i1 = int(np.where(s_lam_grid4 == 1.0)[0][0])
         s_tol_rho = 1e-4  # from the bound: disagreement only inside a margin window of width log(K-1)/lambda (about 1e-3 at lambda=1000)
@@ -541,7 +559,7 @@ def cells():
         # Largest rank displacement (in positions out of n) between each SR ordering and the margin ordering, at lambda=1 and lambda=100.
         def s_max_displacement(key, ref):
             return int(np.max(np.abs(np.argsort(np.argsort(key)) - np.argsort(np.argsort(ref)))))
-        s_disp = {lam: {name: s_max_displacement(-s_keys4[lam][name], s_margin4) for name in s_rho4} for lam in (1.0, 100.0)}
+        s_disp = {lam: {name: s_max_displacement(s_key_for_rc4(s_keys4[lam], name), s_margin4) for name in s_rho4} for lam in (1.0, 100.0)}
         print(f"Largest rank displacement vs margin ordering (n={len(s_margin4)} rows): lambda=1 {s_disp[1.0]}, lambda=100 {s_disp[100.0]}")
         check("S4.4-disp", all(s_disp[100.0][nm] <= s_disp[1.0][nm] for nm in s_rho4),
               "largest rank displacement does not grow from lambda=1 to lambda=100 for any SR score")
@@ -648,8 +666,8 @@ def cells():
         check("S4.6b", s_pred_same and s_margin_T_dev < 1e-12,
               f"predictions identical for every test row: {s_pred_same}; margin RC curve before/after T differs by {s_margin_T_dev:.1e} (< 1e-12)")
 
-        s_srmax_1 = -s_log_complement4(s_zte4, 1.0)["SR_max"]
-        s_srmax_T = -s_log_complement4(s_zte4, 1.0 / s_T4)["SR_max"]
+        s_srmax_1 = -s_log_keys4(s_zte4, 1.0)["SR_max"]
+        s_srmax_T = -s_log_keys4(s_zte4, 1.0 / s_T4)["SR_max"]
         s_rho_T = float(spearmanr(s_srmax_1, s_srmax_T)[0])
         s_risk_s1 = risk_coverage_curve(s_srmax_1, s_correct4)[1]
         s_risk_sT = risk_coverage_curve(s_srmax_T, s_correct4)[1]
