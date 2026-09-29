@@ -24,6 +24,7 @@ nlm/scripts/
 caches/
 data/cache/
 data/raw/
+runtime/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

@@ -30,6 +30,21 @@ The tests specify observable behavior, not internal layout.
 
 Shared builders live in `pipeline_builders.py` (not a test module).
 
+## Round 4 contracts
+
+Chosen plan: `plans/round-04/plan-a.md` (single plan — this round's three requirements are Codex's
+own frozen `review/round-02.md` Round-3 contract, carried forward since none of it was committed).
+
+| Contract | Test file | Oracle |
+| --- | --- | --- |
+| `crc_threshold` infeasible-alpha fallback (`alpha*(n+1) < 1` must return exactly 0.0; feasible regime unchanged) | `test_calibration_infeasible_alpha_contract.py` | Hand-computed order-statistic index for the feasible regime; exact-zero assertion (not "minimum") for the infeasible regime |
+| `silence_windows` region invariant (no window may spill outside its split's fractional region of its source file; resample-else-raise) plus `audit_bundle`'s real `silence_time_overlap` | `test_silence_provenance_contract.py` | In-region offset/content checks against a short-file regression case; fabricated-provenance `audit_bundle` cases including the val-checked-against-train-region aliasing case |
+
+R4.3 (NB2/NB3 growth) has no pytest contract of its own — its harness is
+`plans/round-04/nb2-nb3-growth-contract.md` plus `tools/measure_notebooks.py`'s existing floor
+check, per the project's established notebook-growth convention (frozen baseline + named section
+contract, not a separate test file).
+
 ## Mutation targets
 
 - Seed noise per batch instead of per example, drop clipping after gain, or invert reverb decay ordering: named stress tests must fail.
@@ -40,6 +55,8 @@ Shared builders live in `pipeline_builders.py` (not a test module).
 - Reverse prediction-set threshold ordering, accept stale provenance, or relax the CRC correction: named calibration/cache tests must fail.
 - Include an out-of-set label, make manifest hashing order-dependent, or hide a duplicate checksum: named dataset tests must fail.
 - Change log-mel frame construction, change a condition's optimization budget, unpair prediction rows, or drop resource fields: named experiment tests must fail.
+- Return the empirical minimum instead of exactly 0.0 for an infeasible CRC alpha, or off-by-one the feasible-regime clamp: named `test_calibration_infeasible_alpha_contract.py` tests must fail.
+- Let a silence window spill outside its split's region on a short source file, or check `val` provenance against a `val`-shaped region instead of `train`'s: named `test_silence_provenance_contract.py` tests must fail.
 
 ## Figure specifications
 

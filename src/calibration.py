@@ -63,5 +63,7 @@ def crc_threshold(true_label_scores: np.ndarray, alpha: float) -> float:
         raise ValueError("alpha must be in (0, 1)")
     # The CRC correction bounds the allowable empirical miscoverage count.
     allowed = int(np.floor(alpha * (scores.size + 1) - 1.0 + 1e-12))
+    if allowed < 0:
+        return 0.0
     index = min(max(allowed, 0), scores.size - 1)
     return float(np.sort(scores)[index])

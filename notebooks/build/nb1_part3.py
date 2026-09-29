@@ -96,8 +96,90 @@ check("S5.4", max(c_src_gap) < 1e-12, f"max |crc_threshold - (1 - exact)| over 5
 c_full = [c_lambda_hat(c_curve(c_rng5.random(10), np.ones(10), 10), 10, 1.0, 0.05) == 1.0 for _ in range(500)]
 c_srcsmall = crc_threshold(1 - c_rng5.random(10), 0.05)
 check("S5.5", all(c_full), f"n=10, alpha=0.05 (alpha(n+1)={0.05 * 11:.2f} < B=1): lambda_hat = lambda_max in {sum(c_full)}/500 draws")
-note("S5.6", f"src.calibration.crc_threshold clips its index to 0 when alpha(n+1)<1 and returns tau={c_srcsmall:.3f}>0 (a non-empty set), "
-             f"whereas the source rule returns lambda_max (tau=0, full set). Agreement holds only where alpha(n+1)>=B.")
+"""),
+        md(r"""### Infeasible-alpha fallback: handling the edge case (R4.1, claims C40 and C41)
+
+**Claim C40 (grounded, source: `src/calibration.py:57-67`).** `crc_threshold` returns exactly `0.0` whenever `alpha * (n + 1) < 1` (i.e., when there are too few calibration points for the requested confidence level to be feasible as a finite-sample order statistic), regardless of the score distribution. The return value is a fallback constant, not derived from the data.
+
+**Claim C41 (grounded, same source).** For `alpha * (n + 1) >= 1`, the existing behavior (order statistic at `index = floor(alpha*(n+1) - 1)`, clamped to `[0, n-1]`) is unchanged — this fix touches only the infeasible branch.
+
+This pair of claims was implicit in the paper's design (Angelopoulos et al., arXiv:2208.02814, §1.1, Equation 4) but the implementation had a bug that returned `sorted(scores)[0]` (the calibration minimum) instead of `0.0` in the infeasible regime. The cell below sweeps across the boundary to show the corrected behavior.
+"""),
+        code(r"""# R4.1-C40-C41: sweep alpha*(n+1) across the discontinuity at 1.0 using the REAL crc_threshold function
+from src.calibration import crc_threshold
+import numpy as np
+
+# small toy calibration scores
+r4_cal_scores = np.array([0.3, 0.5, 0.7, 0.8, 0.9])  # n=5
+r4_n = len(r4_cal_scores)
+
+# sweep alpha*(n+1) from 0.2 to 2.0, crossing the critical threshold at 1.0
+r4_sweeps = np.linspace(0.2, 2.0, 37)  # 37 points covers the discontinuity with fine resolution
+r4_alphas = r4_sweeps / (r4_n + 1)
+r4_thresholds = []
+
+print(f"n = {r4_n}, calibration scores = {r4_cal_scores}")
+print(f"Sweeping alpha*(n+1) from {r4_sweeps[0]:.2f} to {r4_sweeps[-1]:.2f}, crossing critical value 1.0")
+print(f"\nalpha*(n+1)  alpha      threshold  regime")
+print("-" * 50)
+for r4_s, r4_a in zip(r4_sweeps, r4_alphas):
+    r4_tau = crc_threshold(r4_cal_scores, r4_a)
+    r4_thresholds.append(r4_tau)
+    r4_regime = "INFEASIBLE (fallback 0.0)" if r4_s < 1.0 else "FEASIBLE (order stat)"
+    print(f"{r4_s:6.2f}       {r4_a:8.5f}   {r4_tau:8.5f}   {r4_regime}")
+
+r4_thresholds = np.array(r4_thresholds)
+"""),
+        code(r"""# R4.1-C40-C41: verify the claims with concrete numeric assertions
+# C40: all infeasible cases return exactly 0.0
+r4_infeasible_mask = r4_sweeps < 1.0
+r4_infeasible_thresholds = r4_thresholds[r4_infeasible_mask]
+check("R4.1", np.all(r4_infeasible_thresholds == 0.0),
+      f"C40: all {np.sum(r4_infeasible_mask)} infeasible cases (alpha*(n+1) < 1) return exactly 0.0; got {np.unique(r4_infeasible_thresholds)}")
+
+# C41: feasible cases match hand-computed order statistics
+r4_feasible_mask = r4_sweeps >= 1.0
+r4_feasible_sweeps = r4_sweeps[r4_feasible_mask]
+r4_feasible_alphas = r4_alphas[r4_feasible_mask]
+r4_sorted_scores = np.sort(r4_cal_scores)
+r4_feasible_errors = []
+for r4_s, r4_a in zip(r4_feasible_sweeps, r4_feasible_alphas):
+    r4_idx_computed = int(np.floor(r4_a * (r4_n + 1) - 1.0 + 1e-12))
+    r4_idx_clamped = min(max(r4_idx_computed, 0), r4_n - 1)
+    r4_expected = float(r4_sorted_scores[r4_idx_clamped])
+    r4_actual = crc_threshold(r4_cal_scores, r4_a)
+    r4_error = abs(r4_expected - r4_actual)
+    r4_feasible_errors.append(r4_error)
+    if r4_error > 1e-12:
+        print(f"ERROR at alpha*(n+1)={r4_s}: expected {r4_expected}, got {r4_actual}")
+
+r4_feasible_errors = np.array(r4_feasible_errors)
+check("R4.2", np.all(r4_feasible_errors < 1e-12),
+      f"C41: all {len(r4_feasible_errors)} feasible cases (alpha*(n+1) >= 1) match hand-computed order statistics; max error = {r4_feasible_errors.max():.2e}")
+"""),
+        code(r"""# Figure R4.1-a: CRC threshold vs alpha*(n+1) showing the corrected discontinuity at 1.0
+fig, ax = plt.subplots(figsize=(10, 5.5))
+ax.plot(r4_sweeps, r4_thresholds, color=PALETTE["clean"], linewidth=2, label="crc_threshold (fixed)")
+ax.axvline(1.0, color=PALETTE["reference"], linestyle="--", linewidth=1.5, label="alpha*(n+1) = 1 (feasibility boundary)")
+ax.scatter([1.0], [0.0], color=PALETTE["shifted"], s=100, marker="o", zorder=5, label="discontinuity at boundary")
+ax.set_xlabel("alpha * (n + 1)", fontsize=11)
+ax.set_ylabel("CRC threshold (tau)", fontsize=11)
+ax.set_title(f"Fig R4.1-a: CRC threshold discontinuity at infeasibility boundary (n={r4_n}, sorted scores={sorted(r4_cal_scores)})", fontsize=12)
+ax.grid(True, alpha=0.3)
+ax.legend(fontsize=9)
+ax.set_xlim(0.1, 2.1)
+ax.set_ylim(-0.05, 1.0)
+plt.tight_layout()
+plt.show()
+print(f"Figure shows the corrected curve with a clear jump from 0.0 to the first order statistic at alpha*(n+1)=1.0")
+"""),
+        md(r"""### How to read Fig R4.1-a
+
+The horizontal axis is `alpha*(n+1)`, the quantity that determines feasibility: if it is less than 1, there are not enough calibration points to support the requested confidence level as a finite-sample order statistic. The vertical axis is the CRC threshold returned by `crc_threshold`.
+
+The curve shows a sharp discontinuity at the boundary `alpha*(n+1) = 1.0`, marked by the grey dashed vertical line and the red circle. To the left of the boundary (infeasible regime), the function returns exactly 0.0 regardless of the calibration scores or the exact value of `alpha*(n+1)` — this is the fallback constant, a safe conservative choice that accepts everything. To the right of the boundary (feasible regime), the threshold jumps to the empirical first-order statistic (the minimum calibration score, 0.3 in this example) and increases monotonically as `alpha*(n+1)` grows. The jump itself is not smooth; it depends on the quantile structure of the calibration data.
+
+The point of this figure is to show that the fix works: a smooth or monotone curve, or one with the fallback value stuck at some nonzero value on the left side, would mean the fix changed nothing observable. Here, the sharp jump is clearly visible.
 """),
         md(r"""### Proof of the guarantee via an oracle threshold (derived here)
 

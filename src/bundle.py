@@ -79,6 +79,8 @@ class DatasetBundle:
     heldout_words: tuple[str, ...]
     manifest_sha256: str
     shortfalls: dict[str, int]
+    silence_provenance: dict[str, tuple[tuple[int, int], ...]] = dataclasses.field(default_factory=dict)
+    silence_source_lengths: tuple[int, ...] = ()
 
 
 def assemble_bundle(
@@ -262,10 +264,14 @@ def assemble_bundle(
 
     train_val_silence_count, cal_silence_count, test_silence_count = silence_counts
 
-    # Generate silence windows from each time region
+    # Generate silence windows from each time region with provenance tracking
+    silence_provenance_dict = {"train": (), "val": (), "cal": (), "test": ()}
+
     # Generate from train+val region and stratify
     if train_val_silence_count > 0:
-        silence_array_70 = silence_windows(noise_arrays, train_val_silence_count, seed=seed, split="train")
+        silence_array_70, train_val_provenance = silence_windows(
+            noise_arrays, train_val_silence_count, seed=seed, split="train", return_provenance=True
+        )
         silence_array_70 = silence_array_70.astype(np.int16)
 
         # Create dummy records for stratification
@@ -286,19 +292,31 @@ def assemble_bundle(
 
         train_silence = silence_array_70[train_silence_indices]
         val_silence = silence_array_70[val_silence_indices]
+
+        # Record provenance for train and val
+        silence_provenance_dict["train"] = tuple(train_val_provenance[i] for i in train_silence_indices)
+        silence_provenance_dict["val"] = tuple(train_val_provenance[i] for i in val_silence_indices)
     else:
         train_silence = np.array([], dtype=np.int16).reshape(0, CLIP)
         val_silence = np.array([], dtype=np.int16).reshape(0, CLIP)
 
     # Generate silence from cal region
     if cal_silence_count > 0:
-        cal_silence = silence_windows(noise_arrays, cal_silence_count, seed=seed, split="cal").astype(np.int16)
+        cal_silence_array, cal_provenance = silence_windows(
+            noise_arrays, cal_silence_count, seed=seed, split="cal", return_provenance=True
+        )
+        cal_silence = cal_silence_array.astype(np.int16)
+        silence_provenance_dict["cal"] = tuple(cal_provenance)
     else:
         cal_silence = np.array([], dtype=np.int16).reshape(0, CLIP)
 
     # Generate silence from test region
     if test_silence_count > 0:
-        test_silence = silence_windows(noise_arrays, test_silence_count, seed=seed, split="test").astype(np.int16)
+        test_silence_array, test_provenance = silence_windows(
+            noise_arrays, test_silence_count, seed=seed, split="test", return_provenance=True
+        )
+        test_silence = test_silence_array.astype(np.int16)
+        silence_provenance_dict["test"] = tuple(test_provenance)
     else:
         test_silence = np.array([], dtype=np.int16).reshape(0, CLIP)
 
@@ -380,7 +398,9 @@ def assemble_bundle(
         train_unknown_words=train_unknown_words,
         heldout_words=heldout_words,
         manifest_sha256=manifest_digest,
-        shortfalls=shortfalls
+        shortfalls=shortfalls,
+        silence_provenance=silence_provenance_dict,
+        silence_source_lengths=tuple(len(arr) for arr in noise_arrays)
     )
 
 
@@ -417,8 +437,41 @@ def audit_bundle(bundle: DatasetBundle) -> dict:
                 heldout_word_leak = True
                 break
 
-    # Check for silence time overlap (would need original noise files)
+    # Check for silence time overlap using provenance data
     silence_time_overlap = False
+    if bundle.silence_provenance and bundle.silence_source_lengths:
+        # Region fractions for each split (val uses train's fractions)
+        region_fractions = {
+            "train": (0.0, 0.7),
+            "val": (0.0, 0.7),  # val shares the train region
+            "cal": (0.7, 0.85),
+            "test": (0.85, 1.0),
+        }
+
+        # Check each split's provenance
+        for split_name in ["train", "val", "cal", "test"]:
+            provenance_list = bundle.silence_provenance.get(split_name, ())
+            if not provenance_list:
+                continue
+
+            start_frac, end_frac = region_fractions[split_name]
+
+            for file_idx, offset in provenance_list:
+                if file_idx >= len(bundle.silence_source_lengths):
+                    silence_time_overlap = True
+                    break
+
+                length = bundle.silence_source_lengths[file_idx]
+                region_start = int(start_frac * length)
+                region_end = int(end_frac * length)
+
+                # Check the invariant: region_start <= offset and offset + 16000 <= region_end
+                if not (region_start <= offset and offset + 16000 <= region_end):
+                    silence_time_overlap = True
+                    break
+
+            if silence_time_overlap:
+                break
 
     # Label counts per split
     label_counts = {}

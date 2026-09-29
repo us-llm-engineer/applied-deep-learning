@@ -122,12 +122,33 @@ def holdout_unknown_words(
 
 
 def silence_windows(
-    noise_arrays: list[np.ndarray], n: int, seed: int, split: str = "train"
-) -> np.ndarray:
+    noise_arrays: list[np.ndarray],
+    n: int,
+    seed: int,
+    split: str = "train",
+    *,
+    return_provenance: bool = False,
+) -> np.ndarray | tuple[np.ndarray, list[tuple[int, int]]]:
     """Generate n deterministic 16000-sample windows from noise arrays.
 
     Each file is split by time: first 70% (train), next 15% (cal), last 15% (test).
     Window offsets are seeded and deterministic.
+
+    Args:
+        noise_arrays: List of noise audio arrays.
+        n: Number of windows to generate.
+        seed: Random seed for reproducibility.
+        split: One of "train", "cal", "test".
+        return_provenance: If True, return (windows, provenance) tuple where provenance
+            is a list of (file_idx, offset) pairs; if False, return only windows array.
+
+    Returns:
+        If return_provenance=False: (n, 16000) float32 ndarray of windows.
+        If return_provenance=True: (windows, provenance) where provenance is list of (file_idx, offset).
+
+    Invariant: For every returned window with provenance (file_idx, offset), the window satisfies:
+        region_start <= offset and offset + 16000 <= region_end
+    where region_start, region_end are computed from the split's fractional boundaries.
     """
     if split not in {"train", "cal", "test"}:
         raise ValueError("split must be one of 'train', 'cal', 'test'")
@@ -140,30 +161,45 @@ def silence_windows(
 
     rng = np.random.default_rng(seed)
     windows = []
+    provenance = [] if return_provenance else None
 
     for _ in range(n):
-        # Select a file uniformly at random
-        file_idx = rng.integers(0, len(noise_arrays))
-        noise = noise_arrays[file_idx]
+        # Find a file whose region can accommodate a 16000-sample window
+        file_idx = None
+        offset = None
+        found = False
 
-        # Compute region boundaries
-        length = len(noise)
-        region_start = int(start_frac * length)
-        region_end = int(end_frac * length)
+        # Keep trying to find a feasible file, with a generous attempt limit
+        max_attempts = len(noise_arrays) * 100
+        for attempt in range(max_attempts):
+            candidate_idx = rng.integers(0, len(noise_arrays))
+            candidate = noise_arrays[candidate_idx]
+            candidate_length = len(candidate)
+            candidate_region_start = int(start_frac * candidate_length)
+            candidate_region_end = int(end_frac * candidate_length)
 
-        # Ensure we can fit a 16000-sample window
-        max_offset = max(0, region_end - 16000)
-        if region_start >= region_end or max_offset < region_start:
-            # Fallback: use the region as-is
-            offset = region_start
-        else:
-            offset = rng.integers(region_start, max_offset + 1)
+            if candidate_region_end - candidate_region_start >= 16000:
+                file_idx = candidate_idx
+                max_offset = max(0, candidate_region_end - 16000)
+                offset = rng.integers(candidate_region_start, max_offset + 1)
+                found = True
+                break
 
-        window = noise[offset : offset + 16000]
-        # Pad if necessary
-        if len(window) < 16000:
-            window = np.pad(window, (0, 16000 - len(window)), mode="constant")
-        windows.append(window[:16000])
+        if not found:
+            raise ValueError(f"No file in noise_arrays has a {split} region large enough for a 16000-sample window")
 
-    return np.array(windows, dtype=np.float32)
+        # Extract window
+        window = noise_arrays[file_idx][offset : offset + 16000]
+        assert len(window) == 16000, f"Window extraction failed: got {len(window)} samples instead of 16000"
+
+        windows.append(window)
+        if return_provenance:
+            provenance.append((int(file_idx), int(offset)))
+
+    result_array = np.array(windows, dtype=np.float32)
+
+    if return_provenance:
+        return result_array, provenance
+    else:
+        return result_array
 
