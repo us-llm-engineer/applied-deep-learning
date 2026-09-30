@@ -9,9 +9,11 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from torch import nn
+from torch.nn.utils import clip_grad_norm_
 from torch.optim import Adam
 
 from .audio import add_white_noise, apply_gain, apply_rir_reverb
+from .diagnostics import cluster_drift_metrics, sentrycam_alert_epoch
 from .experiment import ExperimentConfig
 
 
@@ -24,6 +26,12 @@ class TrainResult:
     epochs_run: int
     optimizer_steps: int
     wall_seconds: float
+    grad_norm_history: list[float]
+    clip_threshold_history: list[float]
+    inter_cluster_distance_history: list[float]
+    intra_cluster_variance_history: list[float]
+    instability_alert_epoch: int | None
+    probe_history: list[dict]
 
 
 def spec_mask(
@@ -153,10 +161,11 @@ def predict_logits(
 
     try:
         model.eval()
+        device = next(model.parameters()).device
         with torch.no_grad():
             for i in range(0, len(x), batch_size):
                 batch = x[i:i + batch_size]
-                batch_tensor = torch.from_numpy(np.asarray(batch, dtype=np.float32))
+                batch_tensor = torch.from_numpy(np.asarray(batch, dtype=np.float32)).to(device)
 
                 if feature_fn is not None:
                     batch_tensor = feature_fn(batch_tensor)
@@ -177,6 +186,8 @@ def train_classifier(
     val_y: np.ndarray,
     config: ExperimentConfig,
     augment_fn=None,
+    progress: bool = False,
+    probe_fn=None,
 ) -> TrainResult:
     """Train a classifier with gradient accumulation and early stopping.
 
@@ -188,6 +199,13 @@ def train_classifier(
         val_y: (n_val,) validation labels.
         config: ExperimentConfig with optimization settings.
         augment_fn: Optional augmentation function for training batches.
+        progress: print a per-epoch progress line. Off by default so the test suite stays quiet;
+            long offloaded runs turn it on so the job is never silent for minutes at a time.
+        probe_fn: optional ``probe_fn(model, epoch) -> dict`` called once per epoch inside the
+            no-grad evaluation block. Whatever it returns is appended to ``TrainResult.probe_history``.
+            Kept deliberately generic: paper-specific probes (representation drift, activation
+            tensors) live in ``src.diagnostics`` and are selected by the caller, so this loop never
+            grows architecture- or methodology-specific code.
 
     Returns:
         TrainResult with trained model, history, and metadata.
@@ -196,6 +214,7 @@ def train_classifier(
 
     # Copy model to avoid mutating input
     model = copy.deepcopy(model)
+    device = next(model.parameters()).device
 
     # Deterministic training
     torch.manual_seed(config.seed)
@@ -205,10 +224,10 @@ def train_classifier(
     loss_fn = torch.nn.CrossEntropyLoss()
 
     # Convert data to tensors
-    train_x_tensor = torch.from_numpy(np.asarray(train_x, dtype=np.float32))
-    train_y_tensor = torch.from_numpy(np.asarray(train_y, dtype=np.int64))
-    val_x_tensor = torch.from_numpy(np.asarray(val_x, dtype=np.float32))
-    val_y_tensor = torch.from_numpy(np.asarray(val_y, dtype=np.int64))
+    train_x_tensor = torch.from_numpy(np.asarray(train_x, dtype=np.float32)).to(device)
+    train_y_tensor = torch.from_numpy(np.asarray(train_y, dtype=np.int64)).to(device)
+    val_x_tensor = torch.from_numpy(np.asarray(val_x, dtype=np.float32)).to(device)
+    val_y_tensor = torch.from_numpy(np.asarray(val_y, dtype=np.int64)).to(device)
 
     model.train()
     history = []
@@ -217,6 +236,11 @@ def train_classifier(
     best_model_state = None
     optimizer_steps = 0
     patience_counter = 0
+    grad_norm_history = []
+    clip_threshold_history = []
+    inter_cluster_distance_history = []
+    intra_cluster_variance_history = []
+    probe_history = []
 
     # Create a shuffler generator
     shuffler_rng = torch.Generator()
@@ -232,35 +256,47 @@ def train_classifier(
 
         # Process microbatches with gradient accumulation
         for batch_idx in range(0, len(indices), config.microbatch_size):
-            batch_indices = indices[batch_idx:batch_idx + config.microbatch_size]
+            batch_indices = indices[batch_idx:batch_idx + config.microbatch_size].to(device)
             x_batch = train_x_tensor[batch_indices]
             y_batch = train_y_tensor[batch_indices]
 
             # Apply augmentation if provided
             if augment_fn is not None:
-                x_batch_before = x_batch.detach().numpy()
+                x_batch_before = x_batch.detach().cpu().numpy()
                 augmented_np = augment_fn(x_batch_before, config.condition, np.random.default_rng(config.seed + epoch * 1000 + batch_idx))
-                x_batch = torch.from_numpy(np.asarray(augmented_np, dtype=np.float32))
+                x_batch = torch.from_numpy(np.asarray(augmented_np, dtype=np.float32)).to(device)
 
             # Forward pass
             logits = model(x_batch)
             loss = loss_fn(logits, y_batch)
+            # Report the true cross-entropy, not the accumulation-scaled one: `loss` below is
+            # divided by accumulation_steps so gradients accumulate correctly, but history must
+            # stay on the same scale as val_loss to be comparable.
+            raw_loss = loss.detach()
 
             # Normalize loss by accumulation steps
             loss = loss / config.accumulation_steps
             loss.backward()
 
-            epoch_loss += loss.detach()
+            epoch_loss += raw_loss
             num_batches += 1
 
             # Optimizer step every accumulation_steps
             if num_batches % config.accumulation_steps == 0:
+                threshold = float(np.percentile(grad_norm_history, config.autoclip_percentile)) if grad_norm_history else float("inf")
+                pre_clip_norm = float(clip_grad_norm_(model.parameters(), max_norm=threshold))
+                grad_norm_history.append(pre_clip_norm)
+                clip_threshold_history.append(threshold)
                 optimizer.step()
                 optimizer.zero_grad()
                 optimizer_steps += 1
 
         # Final step for remaining accumulated gradients
         if num_batches > 0 and num_batches % config.accumulation_steps != 0:
+            threshold = float(np.percentile(grad_norm_history, config.autoclip_percentile)) if grad_norm_history else float("inf")
+            pre_clip_norm = float(clip_grad_norm_(model.parameters(), max_norm=threshold))
+            grad_norm_history.append(pre_clip_norm)
+            clip_threshold_history.append(threshold)
             optimizer.step()
             optimizer.zero_grad()
             optimizer_steps += 1
@@ -272,15 +308,24 @@ def train_classifier(
             val_loss = float(loss_fn(val_logits, val_y_tensor))
             val_pred = torch.argmax(val_logits, dim=1)
             val_accuracy = float((val_pred == val_y_tensor).float().mean())
+            inter_dist, intra_var = cluster_drift_metrics(val_logits.detach().cpu().numpy(), val_y_tensor.cpu().numpy())
+            inter_cluster_distance_history.append(inter_dist)
+            intra_cluster_variance_history.append(intra_var)
+            if probe_fn is not None:
+                probe_history.append(probe_fn(model, epoch))
         model.train()
 
         # Record history
         history.append({
             "epoch": epoch,
-            "train_loss": epoch_loss / num_batches if num_batches > 0 else 0.0,
+            "train_loss": float(epoch_loss / num_batches) if num_batches > 0 else 0.0,
             "val_loss": val_loss,
             "val_accuracy": val_accuracy,
         })
+        if progress:
+            print(f"  epoch {epoch + 1}/{config.max_epochs} done: "
+                  f"train_loss={history[-1]['train_loss']:.4f} "
+                  f"val_loss={val_loss:.4f} val_accuracy={val_accuracy:.4f}", flush=True)
 
         # Early stopping
         if val_loss < best_val_loss:
@@ -299,6 +344,7 @@ def train_classifier(
         model.load_state_dict(best_model_state)
 
     wall_seconds = time.time() - start_time
+    instability_alert_epoch = sentrycam_alert_epoch(inter_cluster_distance_history, intra_cluster_variance_history)
 
     return TrainResult(
         model=model,
@@ -307,4 +353,10 @@ def train_classifier(
         epochs_run=len(history),
         optimizer_steps=optimizer_steps,
         wall_seconds=wall_seconds,
+        grad_norm_history=grad_norm_history,
+        clip_threshold_history=clip_threshold_history,
+        inter_cluster_distance_history=inter_cluster_distance_history,
+        intra_cluster_variance_history=intra_cluster_variance_history,
+        instability_alert_epoch=instability_alert_epoch,
+        probe_history=probe_history,
     )
