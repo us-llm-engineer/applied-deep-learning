@@ -106,6 +106,54 @@ specifies — separate the healthy run from the two unhealthy ones by *when* the
 **Accuracy with bootstrap intervals** across three architectures and four conditions. The `noise_10`
 column is the study's central negative result.
 
+### Representation geometry from the GPU run
+
+The six figures below are the remote training run's own visualisations — penultimate-layer activations
+and hidden-unit tensors captured every epoch on the GPU, then projected. Both are **PCA**, which is a
+labelled deviation: the drift literature specifies a parametric autoencoder and MM-PHATE specifies a
+diffusion-potential embedding with MDS. The deviation is printed in every figure title so it travels
+with the image.
+
+**Penultimate-layer projection, per epoch, coloured by true class.** This is the study's clearest
+picture of learning as geometry.
+
+![PCA latent, ConvGRU](figures/15_pca_latent_gru.png)
+
+`ConvGRU` — a single blob at epoch 1 resolving into separated class groups by epoch 28. Both alert
+epochs are outlined in red: the raw-space alert at epoch 3, when nothing has happened yet, and the
+projected alert at epoch 18, once the geometry has actually settled.
+
+![PCA latent, TimePoolCNN](figures/16_pca_latent_timepool.png)
+
+`TimePoolCNN` — the counterpoint, and the reason the study reports a negative result. Thirty-six
+epochs and the classes never separate; the cloud spreads without organising. Its raw-space and
+projected alerts both fire at epoch 3, which is what an alert looks like when it carries no
+information.
+
+![PCA latent, WideCNN](figures/17_pca_latent_wide.png)
+
+`WideCNN` — partial separation that keeps reorganising rather than settling, matching the violent
+validation-loss oscillation in its training curve.
+
+**Multiway embedding of the activation tensor.** Every node is one (epoch, sequence step, hidden unit)
+triple — 17,920 of them for `ConvGRU` — coloured twice, by epoch and by sequence step.
+
+| | |
+|---|---|
+| ![PCA multiway, ConvGRU](figures/18_pca_multiway_gru.png) | ![PCA multiway, TimePoolCNN](figures/19_pca_multiway_timepool.png) |
+| `ConvGRU`: 20 sequence steps. Late epochs concentrate centrally while sequence step sweeps a clear gradient across the embedding — units specialise by position in the utterance. | `TimePoolCNN`: 8 time slots, and a far weaker step gradient. |
+
+![PCA multiway, WideCNN](figures/20_pca_multiway_wide.png)
+
+`WideCNN` — the widest spread of the three, consistent with its unstable within-class variance.
+
+**All 32 figures from this run are in [`figures/nb4/`](figures/nb4/)** — the six above are the ones
+worth putting on a front page, but the complete set is hosted here rather than left on Drive: the
+V4 cluster-health curves, the V5-V7 MM-PHATE entropy and flow statistics, the per-class geometry, the
+2D nearest-neighbour diagnostics, the resource tables and the full post-training calibration,
+selective-risk, conformal and OOD panels. The checkpoints and the metric arrays they were drawn from
+are in the Drive folder linked below.
+
 ## Papers
 
 **Architecture** — Arık et al., *Convolutional Recurrent Neural Networks for Small-Footprint Keyword
@@ -152,7 +200,7 @@ figures/nb4/       all 32 figures from the real run
 notebooks/     three notebooks and the builder scripts that generate them
 src/           the library under test: data, models, training, diagnostics, calibration, metrics
 tests/         358 contract tests
-figures/       the 14 figures referenced above
+figures/       the 20 figures shown in this README, plus nb4/ with all 32 from the GPU run
 ```
 
 ```bash
