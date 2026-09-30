@@ -33,3 +33,20 @@ __pycache__/
 .venv/
 htmlcov/
 .coverage
+
+# Workflow and private material - never published
+BRIEF.md
+STATE.md
+plans/
+inboxes/
+review/
+log/
+research/
+viz/
+nlm/
+tools/
+viz/
+*.zip
+
+# Local mirrors of the Drive run-artifact folder
+deep-learning-first-project/

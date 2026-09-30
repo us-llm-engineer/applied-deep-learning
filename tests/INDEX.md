@@ -41,7 +41,7 @@ own frozen `review/round-02.md` Round-3 contract, carried forward since none of 
 | `silence_windows` region invariant (no window may spill outside its split's fractional region of its source file; resample-else-raise) plus `audit_bundle`'s real `silence_time_overlap` | `test_silence_provenance_contract.py` | In-region offset/content checks against a short-file regression case; fabricated-provenance `audit_bundle` cases including the val-checked-against-train-region aliasing case |
 
 R4.3 (NB2/NB3 growth) has no pytest contract of its own — its harness is
-`plans/round-04/nb2-nb3-growth-contract.md` plus `tools/measure_notebooks.py`'s existing floor
+the notebook growth contract plus the existing scale floor
 check, per the project's established notebook-growth convention (frozen baseline + named section
 contract, not a separate test file).
 
@@ -60,4 +60,4 @@ contract, not a separate test file).
 
 ## Figure specifications
 
-The `viz/` files describe figures that must be generated from prior notebook computation. They deliberately contain no stored measurements.
+Figure specifications are generated from prior notebook computation and deliberately contain no stored measurements.

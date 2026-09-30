@@ -1,6 +1,6 @@
 """Notebook builder kit. Part files expose `cells()` returning a list built with md()/code().
 
-Assemble with `python notebooks/build/build_nbN.py`; execute with `python tools/run_notebook.py <path>`.
+Assemble with `python notebooks/build/build_nbN.py`, then execute the generated notebook.
 """
 from __future__ import annotations
 

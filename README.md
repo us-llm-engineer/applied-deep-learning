@@ -1,31 +1,186 @@
-# Robust speech command study
+# Robust speech-command recognition under acoustic shift
 
-This repository provides deterministic data, audio-shift, cache, calibration, and paired-evaluation foundations for a compact Speech Commands robustness study. The current notebooks use local synthetic fallbacks to make the setup reviewable without downloading audio or fitting a model; their metrics are demonstrations, not research results.
+Does a model's *confidence* survive acoustic shift as well as its *accuracy* does? This study trains
+small keyword-spotting models on Google Speech Commands v0.02, instruments them during training, and
+then measures calibration, selective risk and conformal coverage as the audio degrades.
 
-## Run locally
+The short answer is no, and the gap is not subtle. Under moderate additive noise the best model keeps
+a plausible-looking output distribution while its accuracy collapses to near chance, and the conformal
+procedure that is supposed to guarantee coverage misses its target by a factor of fifteen.
 
-From this directory, install the project dependencies and run the contract suite:
+Three notebooks: the mathematics, a synthetic sandbox, and the real run.
+
+## Key results
+
+Best architecture (`ConvGRU`, 291,564 parameters) on the real corpus. Exploration configuration —
+4 stress conditions, 200 bootstrap resamples, one seed.
+
+| condition | accuracy | ECE (10 bins) | OOD AUROC | CRC miscoverage (target 0.05) |
+|---|---|---|---|---|
+| clean | 0.8787 | 0.0263 | 0.8291 | 0.0722 |
+| `gain_+10` | 0.8287 | 0.0503 | 0.8046 | 0.1000 |
+| `reverb_mid` | 0.8176 | 0.0482 | 0.7504 | 0.1009 |
+| **`noise_10`** | **0.1380** | **0.7469** | **0.4727** | **0.7565** |
+
+| model | params | val accuracy | final train CE | AutoClip clip rate |
+|---|---|---|---|---|
+| `ConvGRU` | 291,564 | **0.9008** | 0.0100 | 65.8% |
+| `WideCNN` | 271,692 | 0.8790 | 0.0182 | 70.2% |
+| `TimePoolCNN` | 17,212 | 0.5556 | 0.9794 | 99.1% |
+| `LogMelCNN` (global-average-pooled baseline) | 14,524 | 0.3730 | — | — |
+
+**Findings worth stating plainly.**
+
+- **Keeping the time axis is not enough; recurrence is what helps.** `TimePoolCNN` preserves temporal
+  structure and still lands inside the baseline's seed band.
+- **Calibration fails before coverage does, and coverage fails badly.** Even on `clean`, unweighted
+  conformal risk control misses its 0.05 target. Under `noise_10` it reaches 0.7565.
+- **The published explanation does not transfer.** The CRNN literature attributes the recurrent
+  advantage to noise-signature adaptation; here the recurrent model is the *worst* of the three under
+  noise (0.1380 against `WideCNN`'s 0.2519).
+- **A widely-used instability signal is uninformative in raw space.** Measured in the network's own
+  feature space it fires identically for healthy and unhealthy runs; projected first, as its source
+  specifies, it separates them.
+
+## Figures
+
+### Notebook 01 — the mathematics
+
+| | |
+|---|---|
+| ![Order sensitivity](figures/01_order_sensitivity.png) | ![Neural collapse trajectories](figures/02_nc_trajectories.png) |
+| **Global average pooling is order-blind.** Why a model that averages over time cannot distinguish sequences that differ only in order. | **NC1 and NC2 across training.** Within-class variability collapse and the simplex-ETF geometry, per architecture. |
+
+![Neural collapse correspondence](figures/03_neural_collapse_correspondence.png)
+
+**Theory meets measurement.** The cluster-health metric logged during the real run is the 2D, held-out
+analogue of the neural-collapse NC1 numerator: a within-class scatter recomputed from the stored
+coordinates (dashed) lies exactly on the stored series (solid). Panel titles carry each arm's
+terminal-phase status, because NC1 is only defined once training error reaches zero — which
+`TimePoolCNN` never did, so the neural-collapse reading simply does not apply to it.
+
+| | |
+|---|---|
+| ![ECE bins and temperature scaling](figures/04_ece_bins_and_temperature.png) | ![CRC gap and exchangeability](figures/05_crc_gap_and_exchangeability.png) |
+| **ECE is bin-count dependent.** The same predictions score differently at 10, 15 and 20 bins, which is why all three are reported. | **The conformal shortfall obeys its O(1/n) bound (left) — until exchangeability is removed (right),** where miscoverage climbs from 0.10 to 0.39. |
+
+### Notebook 02 — the synthetic sandbox
+
+| | |
+|---|---|
+| ![AutoClip percentile sweep](figures/06_autoclip_percentile_sweep.png) | ![Coverage vs calibration size](figures/09_coverage_vs_calibration_size.png) |
+| **Clipping percentile sweep**, `p ∈ {1, 10, 25, 100}` with `p=100` as the unclipped control. | **How much calibration data a conformal threshold needs.** Coverage is unbiased at every n; the *spread* is what shrinks, following the root-n envelope. |
+
+![Weighted CRC under covariate shift](figures/07_weighted_crc_covariate_shift.png)
+
+**Importance weighting restores coverage under covariate shift — by abstaining.** Unweighted
+miscoverage climbs to 0.56 against a 0.1 target while the weighted estimator holds it, but the fourth
+panel shows the price: prediction sets inflate to all 12 classes. The guarantee is recovered at the
+cost of saying nothing.
+
+![Weighted CRC under label shift](figures/08_weighted_crc_label_shift.png)
+
+**The same experiment under label shift**, with an estimated and an oracle weighting, separating
+"weighting helps" from "knowing the true weights helps".
+
+### Notebook 04 — the real run
+
+| | |
+|---|---|
+| ![Training curves](figures/10_training_curves.png) | ![AutoClip on the real run](figures/11_autoclip_real_run.png) |
+| **True-CE training curves.** All three start just below ln(12) = 2.4849, chance for 12 classes — an independent confirmation that the loss accounting is right. | **Gradient norms against the adaptive threshold.** The threshold tracks the gradient distribution rather than ratcheting down; the real finding is the clip *rate*. |
+
+![Cluster health in 2D](figures/12_cluster_health_2d.png)
+
+**Representation geometry per epoch**, with the rolling-σ band and the alert epochs marked. `ConvGRU`
+separates and tightens; the other two do not.
+
+![Raw versus 2D instability alert](figures/13_raw_vs_2d_alert.png)
+
+**The headline.** Drift metrics computed in raw feature space fire at the same early epoch for every
+architecture and so distinguish nothing. The same metrics computed after projection — as the source
+specifies — separate the healthy run from the two unhealthy ones by *when* they fire.
+
+![Accuracy under stress](figures/14_accuracy_under_stress.png)
+
+**Accuracy with bootstrap intervals** across three architectures and four conditions. The `noise_10`
+column is the study's central negative result.
+
+## Papers
+
+**Architecture** — Arık et al., *Convolutional Recurrent Neural Networks for Small-Footprint Keyword
+Spotting*, [arXiv:1703.05390](https://arxiv.org/abs/1703.05390).
+
+**Representation geometry** — Papyan, Han & Donoho, *Prevalence of Neural Collapse during the terminal
+phase of deep learning training*, [arXiv:2008.08186](https://arxiv.org/abs/2008.08186).
+
+**Calibration** — Hebbalaguppe et al., *A Stitch in Time Saves Nine: A Train-Time Regularizing Loss for
+Improved Neural Network Calibration*, [arXiv:2203.13834](https://arxiv.org/abs/2203.13834).
+
+**Optimization** — Seetharaman et al., *AutoClip: Adaptive Gradient Clipping for Source Separation
+Networks*, [arXiv:2007.14469](https://arxiv.org/abs/2007.14469).
+
+**Drift monitoring** — *SentryCam*, [arXiv:2405.15135](https://arxiv.org/abs/2405.15135), and
+*MM-PHATE*, [arXiv:2406.01969](https://arxiv.org/abs/2406.01969).
+
+**Conformal guarantees** — Angelopoulos et al., *Conformal Risk Control*,
+[arXiv:2208.02814](https://arxiv.org/abs/2208.02814).
+
+**Dataset** — Warden, *Speech Commands: A Dataset for Limited-Vocabulary Speech Recognition*,
+[arXiv:1804.03209](https://arxiv.org/abs/1804.03209).
+
+Each notebook carries a traceability table mapping every claim to its paper, section and formula, and
+states the deviations where this implementation departs from the source.
+
+## Run artifacts
+
+The training checkpoints, the per-epoch metric arrays, the prepared dataset splits and the full set of
+32 generated figures are hosted separately, since they are too large to version here:
+
+**[deep-learning-first-project on Google Drive](https://drive.google.com/drive/folders/1_aUK1YWY_XwKDWF3iWwtrNkL_gNyF0ex?usp=sharing)**
+
+```
+checkpoints/       trained weights for every architecture
+metrics/           arch-*.result.json and arch-*.probes.npz -- what the notebooks read
+train-val-split/   the prepared splits, so the run is reproducible without re-downloading 2.4 GB
+figures/nb4/       all 32 figures from the real run
+```
+
+## Layout and running it
+
+```
+notebooks/     three notebooks and the builder scripts that generate them
+src/           the library under test: data, models, training, diagnostics, calibration, metrics
+tests/         358 contract tests
+figures/       the 14 figures referenced above
+```
 
 ```bash
 python3 -m pip install -e .
-python3 -m pytest tests -q
+python3 -m pytest tests -q          # 358 passed
 ```
 
-Run the lightweight foundations notebook:
+Notebooks are generated from `notebooks/build/` — edit the builder scripts, then regenerate:
 
 ```bash
-python3 -c "import nbformat; from nbclient import NotebookClient; p='notebooks/01_research_foundations.ipynb'; n=nbformat.read(p, as_version=4); NotebookClient(n, timeout=300, kernel_name='python3').execute(); nbformat.write(n, p)"
+python3 notebooks/build/build_nb1.py
+jupyter nbconvert --to notebook --execute --inplace notebooks/01_research_foundations.ipynb
 ```
 
-Notebook 02 combines local synthetic checks and figures with cells tagged `offloaded`. Run only untagged code cells on a local CPU. The tagged cells describe actual archive preparation, feature caching, model training, and held-out bootstrap work; execute them on the designated accelerator and bring back the same code, outputs, artifact hashes, and resource records. Do not run those cells as part of a local notebook execution.
+Notebook 04's cells are tagged `offloaded` where they need the run artifacts above; a local run skips
+them rather than failing. See `notebooks/README.md` for what each notebook does and `src/README.md`
+for the library.
 
-## Selected references
+## Scope and limitations
 
-- Warden, *Speech Commands: A Dataset for Limited-Vocabulary Speech Recognition* (2018), [arXiv:1804.03209](https://arxiv.org/abs/1804.03209). The dataset distribution is identified as CC BY 4.0 in its [TensorFlow Datasets catalog](https://www.tensorflow.org/datasets/catalog/speech_commands); verify the downloaded release and attribution requirements before redistribution.
-- Angelopoulos et al., *Conformal Risk Control* (ICLR 2024), [paper page](https://proceedings.iclr.cc/paper_files/paper/2024/hash/f3549ef9b5ff520a7e41ff3cc306ab2b-Abstract-Conference.html).
-- Liang, Peng, and Sun, *Selective Classification Under Distribution Shifts* (TMLR 2024), [paper page](https://mlanthology.org/tmlr/2024/liang2024tmlr-selective/).
-- Erichson et al., *NoisyMix: Boosting Model Robustness to Common Corruptions* (AISTATS 2024), [paper page](https://proceedings.mlr.press/v238/erichson24a.html).
-
-## Limitations
-
-The current local notebooks do not download the public dataset, fit a CNN or pretrained encoder, or establish a robustness improvement. The planned 70/15/15 split is sample-level and can place the same speaker in multiple partitions. Acoustic augmentation motivated by non-audio corruption work remains an empirical hypothesis. Calibration thresholds measured on shifted test data are descriptive and do not provide a shift-valid guarantee. Heavy cells require the separately budgeted accelerator run; absent pretrained weights or a stopped run must be reported as unavailable rather than replaced silently.
+- Results are an **exploration** configuration: 4 stress conditions, 200 bootstrap resamples, one
+  training seed. The 11-condition, 2000-resample evaluation was never run.
+- The frozen-versus-adapted pretrained-encoder comparison was never run.
+- Conformal risk control here is **unweighted**, the known failure mode under shift. It is measured
+  and reported, not fixed.
+- Where a method is approximated — PCA substituting for a parametric autoencoder, or for diffusion
+  plus MDS — the deviation is labelled in the figure title and in the notebook's limitations section.
+- Literature figures are attributed to a paper and a conversation turn. They were checked verbatim
+  when written, but the raw research answers are not published here, so that check is not reproducible
+  from this repository; audit them at the arXiv sources.
+- Notebook 02 is synthetic by design. Notebook 04 contains no synthetic data of any kind.
