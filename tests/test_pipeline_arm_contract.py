@@ -66,12 +66,21 @@ def fixed_runs(bundle):
     return go
 
 
-def _expected(waves_int16, stress=None, seed=17):
+def _train_stats(bundle):
+    """The exact (mean, std) run_arm derives from the train split to normalize every feature array."""
+    from src.arms import _feature_stats, _features, _to_float
+    return _feature_stats(_features(_to_float(bundle.splits["train"].waveforms)))
+
+
+def _expected(waves_int16, stats, stress=None, seed=17):
+    from src.arms import _normalize
     x = _float(waves_int16)
     if stress:
         x, _ = apply_stress(x, stress, seed=seed)
+    feats = log_mel(torch.from_numpy(x)).numpy()
+    feats = _normalize(feats, *stats)  # run_arm standardizes by train-split stats before predicting
     with torch.no_grad():
-        return FixedModel().eval()(log_mel(torch.from_numpy(x))).numpy()
+        return FixedModel().eval()(torch.from_numpy(feats)).numpy()
 
 
 # ------------------------------------------------------------------ run_arm
@@ -94,11 +103,79 @@ def test_arm_run_shapes_keys_and_resources(bundle, clean_run):
     assert r.ids_test == sp["test"].ids
     assert r.train["epochs_run"] == 2 and 0 <= r.train["best_epoch"] < 2
     assert r.train["optimizer_steps"] > 0 and r.train["wall_seconds"] >= 0
+    assert len(r.train["history"]) == r.train["epochs_run"]
+    assert {"train_loss", "val_loss", "val_accuracy"} <= set(r.train["history"][0])
     ref = LogMelCNN()
     assert r.resources["parameters"] == count_parameters(ref)
     assert r.resources["model_size_bytes"] == model_size_bytes(ref)
     assert r.resources["latency_cpu_median_ms"] > 0
     assert r.resources["peak_memory_mb"] == 0.0 and r.resources["device"] == "cpu"
+
+
+def test_arm_run_with_a_checkpoint_path_saves_a_loadable_state_dict(bundle, tmp_path):
+    """checkpoint_path is a pure side effect: run_arm still returns normally, and the saved
+    state_dict loads into a fresh model with the same architecture without error."""
+    path = tmp_path / "arm.pt"
+    r = _run(bundle, checkpoint_path=str(path))
+    assert path.exists()
+    state_dict = torch.load(path, map_location="cpu", weights_only=True)
+    fresh = LogMelCNN()
+    fresh.load_state_dict(state_dict)  # raises on key/shape mismatch
+    assert r.logits_cal.shape[0] == bundle.splits["cal"].y.size
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_arm_run_on_cuda_reports_cuda_device_and_measures_positive_peak_memory(bundle):
+    """Same shape/finiteness contract as the CPU run, but device=cuda must actually place the
+    model on the GPU: resources.device reports cuda and peak_memory_mb -- the one value that
+    genuinely differs from the CPU case -- is strictly positive, proving GPU memory was used."""
+    r = _run(bundle, device="cuda")
+    sp = bundle.splits
+
+    assert r.logits_cal.shape == (sp["cal"].y.size, 12)
+    assert set(r.logits_test) == set(STRESS) and set(r.logits_ood) == set(STRESS)
+    for name in STRESS:
+        assert r.logits_test[name].shape == (sp["test"].y.size, 12), name
+        assert r.logits_ood[name].shape == (sp["ood"].y.size, 12), name
+        assert np.isfinite(r.logits_test[name]).all() and np.isfinite(r.logits_ood[name]).all()
+    assert r.ids_test == sp["test"].ids
+    assert r.train["epochs_run"] == 2 and 0 <= r.train["best_epoch"] < 2
+    assert r.train["optimizer_steps"] > 0 and r.train["wall_seconds"] >= 0
+    assert len(r.train["history"]) == r.train["epochs_run"]
+    assert {"train_loss", "val_loss", "val_accuracy"} <= set(r.train["history"][0])
+    for key in (
+        "grad_norm_history",
+        "clip_threshold_history",
+        "inter_cluster_distance_history",
+        "intra_cluster_variance_history",
+        "instability_alert_epoch",
+    ):
+        assert key in r.train, key
+
+    assert r.resources["device"].startswith("cuda")
+    assert r.resources["peak_memory_mb"] > 0.0
+
+
+def test_arm_run_train_dict_passes_through_autoclip_and_cluster_drift_diagnostics_verbatim(bundle, clean_run):
+    """run_arm must copy AutoClip's grad/clip histories and the SentryCam-style cluster-drift
+    histories and alert epoch straight through from TrainResult into ArmRun.train, unchanged."""
+    train = clean_run.train
+    for key in (
+        "grad_norm_history",
+        "clip_threshold_history",
+        "inter_cluster_distance_history",
+        "intra_cluster_variance_history",
+        "instability_alert_epoch",
+    ):
+        assert key in train, key
+
+    assert len(train["grad_norm_history"]) == train["optimizer_steps"]
+    assert len(train["clip_threshold_history"]) == train["optimizer_steps"]
+    assert len(train["inter_cluster_distance_history"]) == train["epochs_run"]
+    assert len(train["intra_cluster_variance_history"]) == train["epochs_run"]
+    assert train["instability_alert_epoch"] is None or (
+        isinstance(train["instability_alert_epoch"], int) and train["instability_alert_epoch"] < train["epochs_run"]
+    )
 
 
 def test_two_runs_with_the_same_seed_give_identical_logits(bundle, clean_run):
@@ -129,14 +206,15 @@ def test_optimizer_steps_are_equal_across_the_three_conditions_and_match_the_bud
 def test_clean_stress_logits_equal_the_plain_forward_pass_and_stressed_rows_are_paired(bundle, fixed_runs):
     """With a training-insensitive model, every row of every stress equals model(stress(test wave i)); cal is clean."""
     r = fixed_runs()
+    stats = _train_stats(bundle)
     test_w = bundle.splits["test"].waveforms
-    assert np.allclose(r.logits_cal, _expected(bundle.splits["cal"].waveforms), atol=1e-5)
-    assert np.allclose(r.logits_test["clean"], _expected(test_w), atol=1e-5)
-    assert np.allclose(r.logits_test["noise_10"], _expected(test_w, "noise_10", seed=17), atol=1e-5)
-    assert np.allclose(r.logits_test["gain_+10"], _expected(test_w, "gain_+10"), atol=1e-5)
+    assert np.allclose(r.logits_cal, _expected(bundle.splits["cal"].waveforms, stats), atol=1e-5)
+    assert np.allclose(r.logits_test["clean"], _expected(test_w, stats), atol=1e-5)
+    assert np.allclose(r.logits_test["noise_10"], _expected(test_w, stats, "noise_10", seed=17), atol=1e-5)
+    assert np.allclose(r.logits_test["gain_+10"], _expected(test_w, stats, "gain_+10"), atol=1e-5)
     ood_w = bundle.splits["ood"].waveforms
-    assert np.allclose(r.logits_ood["clean"], _expected(ood_w), atol=1e-5)
-    assert np.allclose(r.logits_ood["gain_+10"], _expected(ood_w, "gain_+10"), atol=1e-5)
+    assert np.allclose(r.logits_ood["clean"], _expected(ood_w, stats), atol=1e-5)
+    assert np.allclose(r.logits_ood["gain_+10"], _expected(ood_w, stats, "gain_+10"), atol=1e-5)
 
 
 @pytest.mark.parametrize("condition", ["masking", "acoustic"])
@@ -154,9 +232,13 @@ def test_training_forward_passes_see_exactly_the_train_split_once_per_epoch(bund
     seen = torch.cat(FixedModel.train_rows)
     sp = bundle.splits
     assert seen.shape[0] == r.train["epochs_run"] * sp["train"].y.size
+    from src.arms import _normalize
+    stats = _train_stats(bundle)
     pool, owner = [], []
     for name in ("train", "val", "cal", "test"):
-        f = log_mel(torch.from_numpy(_float(sp[name].waveforms)))
+        # run_arm standardizes features by train-split stats, so the oracle pool must too --
+        # otherwise every training row sits a constant offset away from its own source clip.
+        f = torch.from_numpy(_normalize(log_mel(torch.from_numpy(_float(sp[name].waveforms))).numpy(), *stats))
         pool.append(f.flatten(1)); owner += [name] * f.shape[0]
     # The matrix-multiplication cdist path suffers cancellation on these
     # high-dimensional log-mel rows: identical rows can appear ~7e-2 apart.

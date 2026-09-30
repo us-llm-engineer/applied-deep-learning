@@ -377,6 +377,103 @@ def test_augment_fn_output_replaces_the_training_inputs() -> None:
     assert normal_sums and all(total > 0.0 for total in normal_sums)
 
 
+# --------------------------------------------------------------------------- AutoClip (arXiv:2007.14469)
+
+
+def test_autoclip_histories_have_exactly_one_entry_per_real_optimizer_step() -> None:
+    train_x, train_y = _separable(64, 1)
+    val_x, val_y = _separable(32, 2)
+    result = train_classifier(_model(), train_x, train_y, val_x, val_y, _config(max_epochs=5, patience=5))
+    assert len(result.grad_norm_history) == result.optimizer_steps
+    assert len(result.clip_threshold_history) == result.optimizer_steps
+
+
+def test_first_autoclip_threshold_is_unbounded_because_the_history_starts_empty() -> None:
+    """AutoClip's own cumulative-history formulation starts from an empty list, so the very
+    first real optimizer step has nothing to compute a percentile over and must not clip."""
+    train_x, train_y = _separable(64, 1)
+    val_x, val_y = _separable(32, 2)
+    result = train_classifier(_model(), train_x, train_y, val_x, val_y, _config(max_epochs=5, patience=5))
+    assert result.optimizer_steps >= 1
+    assert result.clip_threshold_history[0] == float("inf")
+
+
+def test_autoclip_thresholds_after_the_first_step_equal_the_percentile_of_the_prior_grad_norm_history() -> None:
+    """Every threshold at index i>0 must equal np.percentile of the returned history's own
+    prefix [:i] at config.autoclip_percentile -- computed here with the same call the
+    implementation must make, not hand-derived."""
+    train_x, train_y = _separable(64, 1)
+    val_x, val_y = _separable(32, 2)
+    cfg = _config(max_epochs=5, patience=5, autoclip_percentile=37.0)
+    result = train_classifier(_model(), train_x, train_y, val_x, val_y, cfg)
+    assert result.optimizer_steps > 1, "need at least one post-first step to exercise the percentile branch"
+    for i in range(1, result.optimizer_steps):
+        expected = np.percentile(result.grad_norm_history[:i], cfg.autoclip_percentile)
+        assert result.clip_threshold_history[i] == pytest.approx(expected), f"index {i}"
+
+
+def test_autoclip_grad_norm_history_values_are_finite_and_non_negative() -> None:
+    train_x, train_y = _separable(64, 1)
+    val_x, val_y = _separable(32, 2)
+    result = train_classifier(_model(), train_x, train_y, val_x, val_y, _config(max_epochs=5, patience=5))
+    assert np.isfinite(result.grad_norm_history).all()
+    assert (np.asarray(result.grad_norm_history) >= 0).all()
+
+
+def test_changing_autoclip_percentile_changes_thresholds_but_not_the_number_of_optimizer_steps() -> None:
+    train_x, train_y = _separable(64, 1)
+    val_x, val_y = _separable(32, 2)
+    low = train_classifier(_model(), train_x, train_y, val_x, val_y, _config(max_epochs=6, patience=6, autoclip_percentile=1.0))
+    high = train_classifier(_model(), train_x, train_y, val_x, val_y, _config(max_epochs=6, patience=6, autoclip_percentile=50.0))
+
+    assert len(low.grad_norm_history) == len(high.grad_norm_history) == low.optimizer_steps == high.optimizer_steps
+    assert low.clip_threshold_history != high.clip_threshold_history, (
+        "a 1st vs 50th percentile clip threshold must diverge once at least two real steps have run"
+    )
+
+
+def test_training_with_autoclip_still_reaches_high_accuracy_on_a_separable_problem() -> None:
+    """Relaxed re-run of the pre-AutoClip 90% convergence check: the default percentile=10.0
+    must not break real learning on this easy toy problem, and predictions must not collapse
+    to a single always-predicted class."""
+    train_x, train_y = _separable(64, 1)
+    val_x, val_y = _separable(32, 2)
+    result = train_classifier(_model(), train_x, train_y, val_x, val_y, _config())
+
+    logits = predict_logits(result.model, val_x)
+    predictions = np.argmax(logits, axis=1)
+    accuracy = float((predictions == val_y).mean())
+    assert accuracy >= 0.85
+    assert len(set(predictions.tolist())) > 1, "must not degenerate to always predicting one class"
+
+
+# --------------------------------------------------------------------------- SentryCam-inspired cluster drift (arXiv:2405.15135)
+# (cluster_drift_metrics and sentrycam_alert_epoch themselves are tested directly, with hand
+# computed numbers, in test_sentrycam_diagnostics_contract.py; these tests only check that
+# train_classifier wires per-epoch tracking into TrainResult's own new fields correctly.)
+
+
+def test_cluster_drift_histories_have_one_entry_per_epoch_and_are_finite() -> None:
+    train_x, train_y = _separable(64, 1)
+    val_x, val_y = _separable(32, 2)
+    result = train_classifier(_model(), train_x, train_y, val_x, val_y, _config(max_epochs=6, patience=6))
+
+    assert len(result.inter_cluster_distance_history) == result.epochs_run
+    assert len(result.intra_cluster_variance_history) == result.epochs_run
+    assert np.isfinite(result.inter_cluster_distance_history).all()
+    assert np.isfinite(result.intra_cluster_variance_history).all()
+
+
+def test_instability_alert_epoch_is_none_or_a_valid_epoch_index() -> None:
+    train_x, train_y = _separable(64, 1)
+    val_x, val_y = _separable(32, 2)
+    result = train_classifier(_model(), train_x, train_y, val_x, val_y, _config(max_epochs=20, patience=20))
+
+    assert result.instability_alert_epoch is None or (
+        isinstance(result.instability_alert_epoch, int) and 0 <= result.instability_alert_epoch < result.epochs_run
+    )
+
+
 # --------------------------------------------------------------------------- predict_logits
 
 
@@ -437,3 +534,91 @@ def test_predict_logits_applies_the_feature_function_before_the_model() -> None:
         expected = model(torch.from_numpy(x) * 2).numpy()
     logits = predict_logits(model, x, feature_fn=lambda t: t * 2)
     assert np.allclose(logits, expected, atol=1e-6)
+
+
+# --------------------------------------------------------------------------- CUDA device placement
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_predict_logits_on_a_cuda_model_returns_a_plain_finite_cpu_array() -> None:
+    """A model explicitly moved to cuda, given plain numpy input, must not require the
+    caller to place any tensor: predict_logits infers the device from the model itself."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(3, 5), nn.ReLU(), nn.Linear(5, 2)).to("cuda")
+    x = np.random.default_rng(0).normal(size=(9, 3)).astype(np.float32)
+
+    logits = predict_logits(model, x)
+
+    assert type(logits) is np.ndarray
+    assert logits.shape == (9, 2)
+    assert logits.dtype in (np.float32, np.float64)
+    assert np.isfinite(logits).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_train_classifier_on_a_cuda_model_produces_python_float_losses_keeps_the_model_on_cuda_and_still_learns() -> None:
+    """Given a model moved to cuda, when trained for a few epochs, then every history row's
+    train_loss/val_loss is a genuine Python float (not a 0-dim CUDA tensor -- the line-302 bug
+    this test targets raises on CUDA even though it silently "works" on CPU), the returned
+    model's parameters are still on cuda, and validation accuracy improves over the untrained
+    baseline on this easily separable problem."""
+    train_x, train_y = _separable(64, 1)
+    val_x, val_y = _separable(32, 2)
+    model = _model().to("cuda")
+    untrained_loss = _val_loss(model, val_x, val_y)
+    untrained_logits = predict_logits(model, val_x)
+    untrained_accuracy = float((np.argmax(untrained_logits, axis=1) == val_y).mean())
+
+    result = train_classifier(model, train_x, train_y, val_x, val_y, _config(max_epochs=5, patience=5))
+
+    assert isinstance(result, TrainResult)
+    for row in result.history:
+        assert type(row["train_loss"]) is float, row
+        assert type(row["val_loss"]) is float, row
+    assert next(result.model.parameters()).device.type == "cuda"
+    best = result.history[result.best_epoch]
+    assert best["val_loss"] < untrained_loss
+    assert best["val_accuracy"] > untrained_accuracy
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_train_classifier_on_cuda_with_an_augment_fn_exercises_the_cpu_numpy_round_trip_without_error() -> None:
+    """augment_fn forces train_classifier to detach a training batch to numpy and rebuild a
+    tensor from it (the line 252/254 round-trip); on a CUDA model this must move the
+    rebuilt tensor back to cuda, and history rows must still be genuine Python floats."""
+    train_x, train_y = _separable(64, 1)
+    val_x, val_y = _separable(32, 2)
+    model = _model().to("cuda")
+
+    def add_fixed_offset(batch, _condition, _rng):
+        return batch + 0.01
+
+    result = train_classifier(
+        model, train_x, train_y, val_x, val_y, _config(max_epochs=3, patience=3), augment_fn=add_fixed_offset,
+    )
+
+    assert isinstance(result, TrainResult)
+    assert len(result.history) == result.epochs_run
+    for row in result.history:
+        assert type(row["train_loss"]) is float, row
+        assert type(row["val_loss"]) is float, row
+    assert next(result.model.parameters()).device.type == "cuda"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_cluster_drift_histories_on_cuda_are_genuine_python_floats() -> None:
+    """Regression guard on top of "doesn't crash": cluster_drift_metrics already returns
+    Python floats on CPU; the .cpu() fix needed to call it on CUDA logits/labels must
+    preserve that float contract, not just avoid a device-mismatch exception."""
+    train_x, train_y = _separable(64, 1)
+    val_x, val_y = _separable(32, 2)
+    model = _model().to("cuda")
+
+    result = train_classifier(model, train_x, train_y, val_x, val_y, _config(max_epochs=5, patience=5))
+
+    assert len(result.inter_cluster_distance_history) == result.epochs_run
+    assert len(result.intra_cluster_variance_history) == result.epochs_run
+    for value in result.inter_cluster_distance_history:
+        assert type(value) is float, value
+    for value in result.intra_cluster_variance_history:
+        assert type(value) is float, value

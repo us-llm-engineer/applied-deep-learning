@@ -35,8 +35,16 @@ def test_mean_pool_with_lengths_ignores_padded_frames():
     assert torch.allclose(got, torch.tensor([[2., 3.], [2., 2.]]))
 
 
-class FakeEncoder:
-    """Duck-typed like torchaudio Wav2Vec2Model: extract_features(waveforms, lengths) -> (layers, lengths)."""
+class FakeEncoder(nn.Module):
+    """Duck-typed like torchaudio Wav2Vec2Model: extract_features(waveforms, lengths) -> (layers, lengths).
+
+    A minimal real nn.Module (registers one parameter) so next(encoder.parameters()).device
+    works against it, mirroring _ScriptedClock in test_latency_contract.py.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(1))
 
     def extract_features(self, waveforms, lengths=None):
         b = waveforms.shape[0]
@@ -69,6 +77,20 @@ def test_extract_hidden_values_do_not_depend_on_batch_size():
 def test_extract_hidden_rejects_a_layer_index_beyond_the_available_layers():
     with pytest.raises(ValueError):
         extract_hidden(FakeEncoder(), _waves(), layer_index=LAYERS, batch_size=4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_extract_hidden_moves_mismatched_cpu_waveforms_to_the_encoders_cuda_device():
+    """The encoder lives on cuda but the caller deliberately passes CPU waveforms (no manual
+    .to("cuda") by the caller): extract_hidden must move each batch itself and return a
+    tensor on the encoder's device, not raise a device-mismatch error."""
+    encoder = FakeEncoder().to("cuda")
+    w = _waves()
+    assert w.device.type == "cpu"
+
+    got = extract_hidden(encoder, w, layer_index=1, batch_size=3)
+
+    assert got.device.type == "cuda"
 
 
 def test_linear_head_maps_features_to_class_scores_with_exact_parameter_count():

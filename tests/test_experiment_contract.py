@@ -35,6 +35,25 @@ def test_config_conditions_share_budget_and_reject_unknown_condition() -> None:
         ExperimentConfig(condition="unknown")
 
 
+def test_autoclip_percentile_defaults_to_ten_when_omitted() -> None:
+    cfg = ExperimentConfig(condition="clean", seed=17, max_epochs=6, patience=2, microbatch_size=64, accumulation_steps=2)
+    assert cfg.autoclip_percentile == 10.0
+
+
+@pytest.mark.parametrize("percentile", [0.0, -1.0, -0.0001, 100.0001, 101.0, 1000.0])
+def test_autoclip_percentile_rejects_values_at_or_below_zero_or_above_one_hundred(percentile) -> None:
+    """AutoClip's own p=100 setting means unclipped, so 100 itself must stay legal; only the
+    open lower bound and closed upper bound are enforced."""
+    with pytest.raises(ValueError):
+        ExperimentConfig(autoclip_percentile=percentile)
+
+
+@pytest.mark.parametrize("percentile", [10.0, 100.0, 0.0001, 50.0])
+def test_autoclip_percentile_accepts_the_open_zero_to_closed_hundred_range(percentile) -> None:
+    cfg = ExperimentConfig(autoclip_percentile=percentile)
+    assert cfg.autoclip_percentile == percentile
+
+
 def test_paired_prediction_summary_keeps_identifiers_and_reports_known_metric_change() -> None:
     identifiers = ("a", "b", "c", "d")
     labels = np.array([0, 1, 2, 0])
