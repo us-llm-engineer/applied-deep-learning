@@ -73,7 +73,15 @@ def log_mel(
 
 
 class LogMelCNN(nn.Module):
-    """Small convolutional network accepting log-mel tensors from :func:`log_mel`."""
+    """LEGACY (rounds 1-4) baseline: small conv net accepting log-mel tensors from :func:`log_mel`.
+
+    Retained unchanged as the experimental control. Its final ``AdaptiveAvgPool2d((1, 1))``
+    collapses both the mel and time axes, so the classifier sees only 32 channel means and no
+    temporal order at all -- a structural ceiling on a task whose confusable pairs (``no``/``on``,
+    ``go``/``no``, ``up``/``off``) differ largely by phoneme order. The time-preserving models
+    below exist to measure how much of the accuracy gap that collapse accounts for; this class
+    stays as-is so the comparison has an unchanged reference point.
+    """
 
     def __init__(self, n_mels: int = 40, num_classes: int = 12, width: int = 16) -> None:
         super().__init__()
@@ -98,3 +106,100 @@ class LogMelCNN(nn.Module):
         if features.shape[2] != self.n_mels:
             raise ValueError(f"expected {self.n_mels} mel bins")
         return self.classifier(self.features(features).flatten(1))
+
+
+class TimePoolCNN(nn.Module):
+    """LogMelCNN's convolutions with the temporal collapse removed.
+
+    Identical to :class:`LogMelCNN` except the final pool keeps ``time_slots`` temporal
+    positions instead of one, so the classifier sees when energy occurred, not just how much.
+    Deliberately minimal: it isolates the effect of the pooling change alone.
+    """
+
+    def __init__(self, n_mels: int = 40, num_classes: int = 12, width: int = 16, time_slots: int = 8) -> None:
+        super().__init__()
+        if n_mels <= 0 or num_classes <= 0 or width <= 0 or time_slots <= 0:
+            raise ValueError("n_mels, num_classes, width, and time_slots must be positive")
+        self.n_mels = int(n_mels)
+        self.num_classes = int(num_classes)
+        self.features = nn.Sequential(
+            nn.Conv2d(1, width, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=False), nn.MaxPool2d(2),
+            nn.Conv2d(width, width * 2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(width * 2), nn.ReLU(inplace=False),
+            nn.Conv2d(width * 2, width * 2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(width * 2), nn.ReLU(inplace=False),
+            nn.AdaptiveAvgPool2d((1, time_slots)),
+        )
+        self.classifier = nn.Linear(width * 2 * time_slots, num_classes)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if features.ndim != 4 or features.shape[1] != 1:
+            raise ValueError("features must have shape (batch, 1, mel, frames)")
+        return self.classifier(self.features(features).flatten(1))
+
+
+class WideCNN(nn.Module):
+    """Wider and deeper than :class:`TimePoolCNN`, still time-preserving.
+
+    Separates "more capacity" from "kept the time axis": compared against TimePoolCNN it
+    measures what widening buys once the temporal bottleneck is already gone.
+    """
+
+    def __init__(self, n_mels: int = 40, num_classes: int = 12, width: int = 64, time_slots: int = 8) -> None:
+        super().__init__()
+        if n_mels <= 0 or num_classes <= 0 or width <= 0 or time_slots <= 0:
+            raise ValueError("n_mels, num_classes, width, and time_slots must be positive")
+        self.n_mels = int(n_mels)
+        self.num_classes = int(num_classes)
+        self.features = nn.Sequential(
+            nn.Conv2d(1, width, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=False), nn.MaxPool2d(2),
+            nn.Conv2d(width, width, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=False), nn.MaxPool2d(2),
+            nn.Conv2d(width, width * 2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(width * 2), nn.ReLU(inplace=False),
+            nn.Conv2d(width * 2, width * 2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(width * 2), nn.ReLU(inplace=False),
+            nn.AdaptiveAvgPool2d((1, time_slots)),
+        )
+        self.classifier = nn.Linear(width * 2 * time_slots, num_classes)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if features.ndim != 4 or features.shape[1] != 1:
+            raise ValueError("features must have shape (batch, 1, mel, frames)")
+        return self.classifier(self.features(features).flatten(1))
+
+
+class ConvGRU(nn.Module):
+    """Convolutions over mel, then a bidirectional GRU over time: an explicit sequence model.
+
+    Pools only the mel axis, so the time axis survives into the recurrence. This is the
+    variant that can in principle represent phoneme order rather than a bag of local patterns.
+    """
+
+    def __init__(self, n_mels: int = 40, num_classes: int = 12, width: int = 32, hidden: int = 64) -> None:
+        super().__init__()
+        if n_mels <= 0 or num_classes <= 0 or width <= 0 or hidden <= 0:
+            raise ValueError("n_mels, num_classes, width, and hidden must be positive")
+        if n_mels % 4 != 0:
+            raise ValueError("n_mels must be divisible by 4 (two mel-axis pools of stride 2)")
+        self.n_mels = int(n_mels)
+        self.num_classes = int(num_classes)
+        self.features = nn.Sequential(
+            nn.Conv2d(1, width, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(width), nn.ReLU(inplace=False), nn.MaxPool2d((2, 1)),
+            nn.Conv2d(width, width * 2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(width * 2), nn.ReLU(inplace=False), nn.MaxPool2d((2, 1)),
+        )
+        self.gru = nn.GRU(width * 2 * (n_mels // 4), hidden, batch_first=True, bidirectional=True)
+        self.classifier = nn.Linear(hidden * 2, num_classes)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if features.ndim != 4 or features.shape[1] != 1:
+            raise ValueError("features must have shape (batch, 1, mel, frames)")
+        conv = self.features(features)
+        batch, channels, mel, frames = conv.shape
+        sequence = conv.permute(0, 3, 1, 2).reshape(batch, frames, channels * mel)
+        output, _ = self.gru(sequence)
+        return self.classifier(output.mean(dim=1))
