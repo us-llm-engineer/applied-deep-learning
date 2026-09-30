@@ -219,6 +219,10 @@ Notebook 04's cells are tagged `offloaded` where they need the run artifacts abo
 them rather than failing. See `notebooks/README.md` for what each notebook does and `src/README.md`
 for the library.
 
+## Training hardware
+
+Google Colab L4 with 22 VRAM of GPU.
+
 ## Scope and limitations
 
 - Results are an **exploration** configuration: 4 stress conditions, 200 bootstrap resamples, one
