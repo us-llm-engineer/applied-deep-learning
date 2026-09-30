@@ -1,607 +1,425 @@
-"""Notebook 1, Part 1: Research foundations — probability metrics and temperature scaling (derived here).
+"""NB1 part 1: charter, traceability table, and the recurrent-over-convolutional derivation (sections 1-2).
 
-Sections:
-- 0. Scope, disclaimer, and the guarantee zoo
-- 1. Probability metrics: NLL, Brier, ECE
-- 2. Temperature scaling as one-parameter maximum likelihood
+Every measured number is loaded from runtime/metrics/ (real run artifacts); literature numbers are quoted from the
+files). The only constructed inputs anywhere in this notebook are labelled unit-test fixtures for formulas.
 """
-
 from nbkit import md, code
 
 
 def cells():
     return [
-        # ─────────────────────────────────────────────────────────────────────────────────
-        # Section 0: Scope, disclaimer, and the guarantee zoo (derived here)
-        # ─────────────────────────────────────────────────────────────────────────────────
+        md(r"""
+        ## 1. Charter and traceability
 
-        md("""
-        ## 0. Scope, disclaimer, and the guarantee zoo (derived here)
+        **What this notebook is.** A mathematical foundation for one measured result: a ConvGRU speech-command
+        classifier (`gru`, 291,564 parameters) reached a validation accuracy of $0.9008$, while the project's legacy
+        globally-average-pooled CNN (`baseline`, a `LogMelCNN` with 14,524 parameters) ended at $0.3730$ on the same
+        seed. The notebook derives the mathematics that is *supposed* to explain that gap, and it says plainly where
+        the literature and our measurements agree, where they disagree, and where they simply cannot be compared.
 
-        This notebook studies probability calibration, confidence metrics, and risk control through toy models, Monte Carlo validation, and first-principles derivations. All code, examples, and measurements are **exploratory and unoptimized**: this is research-stage work on synthetic data, not a production system.
+        **What this notebook is not.** It trains nothing. It runs on a CPU in well under a minute. Every measured
+        quantity is read from files that a real GPU run produced (`runtime/metrics/arch-*.result.json`,
+        `arch-*.probes.npz`, and the legacy training logs), and every literature quantity is read from the NotebookLM
+        NotebookLM sessions recorded in the traceability table of section 1.2. The few constructed inputs that do appear (a simplex equiangular tight
+        frame, a permuted feature map, a Monte-Carlo draw of exchangeable scores) are **unit-test fixtures for a
+        formula or estimator**, are labelled as such at the cell, and are never presented as evidence about speech.
 
-        **What this notebook is:** Graduate-level treatment of calibration theory grounded in the literature (q9, q10), with numeric validation and honest negative results when methods fail.
+        **Reading discipline.** Three kinds of statement are kept apart throughout.
 
-        **What this notebook is not:** A production implementation, a hyperparameter tuning guide, or an endorsement of specific threshold choices for real systems.
+        - *Paper claim*: something a source paper states, tagged with the arXiv id and the NotebookLM turn that
+          returned it.
+        - *Derived here*: algebra that this notebook proves and then checks numerically.
+        - *Measured here*: a number loaded from an artifact, printed by a code cell, with the file it came from.
 
-        Each metric below promises certain properties under specific assumptions. The table below identifies what each metric measures and what it does **not** guarantee:
+        A parallel between a paper claim and a measured number is an *observation*, never a causal claim. The last
+        section collects every reason that is so.
+
+        **Section map.** Section 2 derives why a recurrent head preserves what global average pooling destroys.
+        Section 3 is the honest tension: under the `noise_10` stress condition our `gru` is the *worst* of three
+        arms, the reverse of the mechanism the CRNN paper proposes. Section 4 derives neural-collapse metrics NC1 and
+        NC2 and states, before any comparison, the precondition and the measurement deviations. Section 5 derives
+        adaptive gradient clipping. Section 6 covers calibration, including the one observation about fitted
+        temperatures that is worth testing. Section 7 carries the salvaged derivations (proper scoring rules,
+        temperature scaling as maximum likelihood, and the conformal-risk-control estimator with its Monte-Carlo
+        check). Section 8 lists the limitations.
         """),
 
-        md("""
-        | Metric | Promises | Does NOT promise | Source |
-        |:---|:---|:---|:---|
-        | **NLL (Negative Log-Likelihood)** | Penalizes low predicted probability on true class; minimized at true distribution (proper scoring) | Calibration on different domain; robustness to label noise | MLE / cross-entropy (derived here) |
-        | **Brier Score** | Penalizes squared distance from one-hot target; proper scoring; has decomposition into reliability, resolution, uncertainty | Perfect calibration; robustness to class imbalance | Multiclass (derived here; Murphy 1971) |
-        | **ECE (Expected Calibration Error)** | Estimates mean absolute gap between confidence and correctness across bins | Sensitivity to bin count; finite-sample bias with small n; robustness to shift | Binning (derived here; Guo et al. 2017) |
-        | **Coverage (Conformal)** | Finite-sample guarantee: $\\mathbb{P}(Y \\in C(X)) \\ge 1 - \\alpha - O(1/n)$ under exchangeability | Distribution-free adaptation to shift without density weighting | q9, q10: Conformal Risk Control (Angelopoulos et al. 2024) |
-        | **Selective Risk** | Risk at fixed coverage level (top-k rejection); illustrates trade-off between retention and error rate | Computational efficiency; guarantee under shift | Risk-coverage curve (derived here) |
-        | **AURC (Area Under Risk-Coverage Curve)** | Single-number summary of risk trajectory as coverage varies; lower is better | Emphasis on specific coverage regime; optimality under all shifts | Risk-coverage integration (derived here) |
-        | **CRC Risk Bound** | Conservative threshold that guarantees miscoverage control: $\\mathbb{E}[\\mathbb{I}(Y \\notin C)] \\le \\alpha$ on test data | Adaptation post-hoc; data-dependent guarantees | q10: Conformal Risk Control (Angelopoulos et al. 2024) |
+        code(r"""
+        # N1.1.1: shared loader. Real artifacts only; there is no synthetic fallback for measured quantities.
+        import json, re, hashlib, platform
+        import pandas as pd
+        pd.set_option("display.notebook_repr_html", False)
+        pd.set_option("display.width", 220, "display.max_colwidth", 130, "display.max_columns", 30)
+        from IPython.display import display
+        from scipy import stats
+
+        MET = ROOT / "runtime" / "metrics"
+        FIGDIR = ROOT / "runtime" / "figures" / "nb1"
+        FIGDIR.mkdir(parents=True, exist_ok=True)
+        ARCHS = ["gru", "timepool", "wide"]
+        ACOL = {"gru": "#3568A8", "timepool": "#E58B2A", "wide": "#3A8D68", "baseline": "#7f7f7f"}
+
+        if not all((MET / f"arch-{a}.result.json").exists() for a in ARCHS):
+            raise FileNotFoundError(f"arch-*.result.json not found under {MET}; runtime/ is git-ignored and this notebook has no synthetic fallback")
+
+        DATA = {}
+        for a in ARCHS:
+            _z = np.load(MET / f"arch-{a}.probes.npz")
+            DATA[a] = {"res": json.loads((MET / f"arch-{a}.result.json").read_text()), "npz": {k: _z[k] for k in _z.files}}
+
+        # Legacy LogMelCNN ("baseline") clean-condition logs, seeds 17/18/19: parse every finished epoch.
+        LEG = {}
+        for s in (17, 18, 19):
+            txt = (MET / "legacy_6arm_logs" / f"clean_seed{s}.log").read_text()
+            rows = re.findall(r"epoch (\d+)/36 done: train_loss=([\d.]+) val_loss=([\d.]+) val_accuracy=([\d.]+)", txt)
+            LEG[s] = pd.DataFrame(rows, columns=["epoch", "train_loss", "val_loss", "val_accuracy"]).astype(float)
+
+        def savefig(fig, name):
+            # Save under runtime/figures/nb1/ and show inline.
+            fig.savefig(FIGDIR / name, dpi=110, bbox_inches="tight")
+            plt.show()
+            return FIGDIR / name
+
+        def varied(label, *arrays):
+            # A figure whose plotted values are all identical is a defect; make that a visible check.
+            def _flat(x):
+                if isinstance(x, (list, tuple)):
+                    return [q for item in x for q in _flat(item)]
+                return [np.ravel(np.asarray(x, dtype=float))]
+            v = np.concatenate([q for x in arrays for q in _flat(x)])
+            return check(label, np.isfinite(v).all() and np.ptp(v) > 0, f"plotted values finite and not all identical (range {np.ptp(v):.4g})")
+
+        print("host:", platform.node(), "| metrics dir:", MET, "| figure dir:", FIGDIR)
+        for a in ARCHS:
+            r = DATA[a]["res"]
+            print(f"loaded {a:9s} params={r['parameters']:>8,d} epochs_run={r['epochs_run']:>2d} best_epoch={r['best_epoch']:>2d} "
+                  f"best_val_acc(max)={r['best_val_accuracy']:.4f} final_val_acc={r['final_val_accuracy']:.4f} final_train_CE={r['final_train_loss']:.4f}")
+        for s, df in LEG.items():
+            print(f"legacy baseline seed {s}: {len(df)} epochs parsed, last val_accuracy={df.val_accuracy.iloc[-1]:.4f}")
+        check("N1.1.1a", all(DATA[a]["res"]["parameters"] == p for a, p in zip(ARCHS, (291564, 17212, 271692))),
+              "parameter counts gru/timepool/wide = 291,564 / 17,212 / 271,692")
+        check("N1.1.1b", [round(LEG[s].val_accuracy.iloc[-1], 4) for s in (17, 18, 19)] == [0.3730, 0.5913, 0.3433],
+              "legacy baseline final val accuracy by seed 17/18/19 = 0.3730 / 0.5913 / 0.3433")
+        check("N1.1.1c", round(DATA["gru"]["res"]["final_val_accuracy"], 4) == 0.9008, "gru final validation accuracy = 0.9008")
         """),
 
-        code("""
-        # S0.1: Dataset and import check.
-        import numpy as np
-        from src.metrics import nll, brier_score, expected_calibration_error, risk_coverage_curve, selective_risk, aurc
-        from src.calibration import temperature_scale, crc_threshold
-        import matplotlib.pyplot as plt
+        md(r"""
+        ### 1.1 A caveat on the headline numbers, found while loading them
 
-        m_K = 5  # Number of classes
-        m_n_test = 200  # Test set size
-        m_rng_section0 = np.random.default_rng(RNG_SEED + 0)
-
-        # Sanity: can we import all required modules?
-        m_imports_ok = all(callable(x) for x in [nll, brier_score, expected_calibration_error, temperature_scale, crc_threshold])
-        # Total of 5 metrics (NLL, Brier, ECE, Risk-Coverage, Selective Risk) and 2 calibration methods (temperature, CRC).
-        check("S0.1", m_imports_ok, f"Imported {5} metrics + {2} calibration utilities")
+        The number $0.9008$ is the `gru` arm's validation accuracy at its best-loss epoch, and it is also its
+        last-epoch value. The number $0.8790$ quoted for `wide` is different in kind: it is the *maximum* over epochs
+        and equals the accuracy at `wide`'s best epoch, whereas its last-epoch accuracy is $0.7540$. So a
+        "$0.9008$ versus $0.8790$" comparison silently mixes an endpoint with a peak for one arm. The next cell prints
+        all three summaries per arm so that every later sentence can say which one it means. The distinction matters
+        because the `wide` validation curve oscillates by more than ten points between adjacent epochs.
         """),
 
-        # ─────────────────────────────────────────────────────────────────────────────────
-        # Section 1: Probability metrics (NLL, Brier, ECE) (derived here; q9)
-        # ─────────────────────────────────────────────────────────────────────────────────
-
-        md("""
-        ## 1. Probability metrics: NLL, Brier, ECE (derived here; q9)
-
-        This section derives three foundational proper scoring rules (metrics that are minimized at the true probability distribution) and validates them on synthetic data. Unlike coverage and conformal methods, these metrics **are not formally defined in the provided sources** (q9), so we derive them from first principles and benchmark them against canonical definitions.
-
-        ### Negative Log-Likelihood as Maximum Likelihood Estimation
-
-        The Negative Log-Likelihood (NLL) is the canonical loss for probabilistic classification. Given true labels $y_i \\in \\{1, \\ldots, K\\}$ and predicted class probabilities $p_i(y) \\in [0,1]$:
-
-        $$\\text{NLL} = -\\frac{1}{n} \\sum_{i=1}^n \\log p_i(y_i)$$
-
-        This equals the cross-entropy between the empirical label distribution and the predicted distribution. Under the assumption of i.i.d. samples from a true distribution, minimizing NLL is equivalent to maximum likelihood estimation of the class probabilities. It is a **proper scoring rule**: the expected NLL is minimized if and only if $p_i(y) = P(Y=y | X_i)$ (the true conditional probability).
-
-        **Derivation:** Given a single sample $(x_i, y_i)$, the likelihood of observing $y_i$ under predicted distribution $\\{p_i(k)\\}$ is $p_i(y_i)$. The log-likelihood is $\\log p_i(y_i)$. Minimizing the average negative log-likelihood over the dataset is standard maximum likelihood estimation.
-
-        ### Brier Score and Murphy Decomposition
-
-        The multiclass Brier score measures squared Euclidean distance between predicted and one-hot encoded true labels:
-
-        $$\\text{Brier} = \\frac{1}{n} \\sum_{i=1}^n \\sum_{k=1}^K (p_i(k) - y_i^{(k)})^2$$
-
-        where $y_i^{(k)} = \\mathbb{1}(y_i = k)$ is one-hot encoding. This expands as:
-
-        $$\\text{Brier} = \\frac{1}{n} \\sum_{i=1}^n \\left[ \\sum_k p_i(k)^2 - 2 p_i(y_i) + 1 \\right]$$
-
-        Murphy (1971) decomposed Brier into three terms:
-        $$\\text{Brier} = \\text{Reliability} - \\text{Resolution} + \\text{Uncertainty}$$
-
-        where:
-        - **Reliability** measures calibration error (confidence vs. observed frequency),
-        - **Resolution** measures how well predicted probabilities separate classes,
-        - **Uncertainty** is a baseline term independent of predictions.
-
-        Brier is also a proper scoring rule: its expected value is minimized when $p_i(k) = P(Y=k | X_i)$.
-
-        ### Expected Calibration Error (ECE) with Binning
-
-        The Expected Calibration Error (ECE) estimates calibration by partitioning predictions into bins by confidence and computing the empirical gap between mean confidence and mean accuracy in each bin:
-
-        $$\\text{ECE} = \\sum_{b=1}^B \\frac{|I_b|}{n} \\left| \\text{conf}_b - \\text{acc}_b \\right|$$
-
-        where $\\text{conf}_b$ is the mean predicted max-class probability in bin $b$, $\\text{acc}_b$ is the empirical accuracy in that bin, and $|I_b|$ is the bin mass.
-
-        **Known weaknesses of ECE (Guo et al. 2017):**
-        - **Bin count sensitivity:** ECE estimates vary substantially across bin counts (10 vs. 20 vs. 30 bins yield different values from the same data).
-        - **Finite-sample bias:** With small sample sizes, ECE overestimates calibration error due to sampling variance within bins.
-        - **Discrete bins hide regional miscalibration:** Two regions with identical average calibration but opposite local miscalibration can yield the same ECE.
-
-        We use equal-width bins on $[0, 1]$ (the standard choice) and will vary bin count to expose this sensitivity.
+        code(r"""
+        # N1.1.2: three different "validation accuracy" summaries per arm, side by side.
+        rows = []
+        for a in ARCHS:
+            r = DATA[a]["res"]; h = r["history"]
+            va = np.array([e["val_accuracy"] for e in h])
+            rows.append({"arch": a, "params": r["parameters"], "epochs": r["epochs_run"], "best_epoch(min val loss)": r["best_epoch"],
+                         "acc@best_epoch": va[r["best_epoch"]], "max_acc": va.max(), "last_epoch_acc": va[-1],
+                         "sd(last 10 epochs)": va[-10:].std(ddof=1), "final_train_CE": r["final_train_loss"]})
+        SUMM = pd.DataFrame(rows).set_index("arch")
+        display(SUMM.round(4))
+        check("N1.1.2a", abs(SUMM.loc["gru", "acc@best_epoch"] - 0.9008) < 5e-5 and abs(SUMM.loc["gru", "last_epoch_acc"] - 0.9008) < 5e-5,
+              "gru: accuracy at best epoch and at last epoch are both 0.9008")
+        check("N1.1.2b", abs(SUMM.loc["wide", "max_acc"] - 0.8790) < 5e-5 and abs(SUMM.loc["wide", "last_epoch_acc"] - 0.7540) < 5e-5,
+              "wide: 0.8790 is the max/best-epoch value; its last-epoch value is 0.7540")
+        note("N1.1.2c", f"wide last-10-epoch sd = {SUMM.loc['wide','sd(last 10 epochs)']:.4f} vs gru {SUMM.loc['gru','sd(last 10 epochs)']:.4f}: single-number comparisons of wide are fragile")
+        n_val = 504
+        okint = all(abs(SUMM[c] * n_val - np.round(SUMM[c] * n_val)).max() < 1e-2 for c in ["acc@best_epoch", "max_acc", "last_epoch_acc"])
+        check("N1.1.2d", okint, f"every accuracy is an integer multiple of 1/{n_val}: the validation split has {n_val} clips")
         """),
 
-        code("""
-        # S1.1: Toy data generation and worked numeric example for NLL, Brier, ECE.
-        # This cell validates the three foundational proper scoring rules:
-        # NLL (cross-entropy), Brier (squared Euclidean), and ECE (binned calibration).
-        m_np_rng = np.random.default_rng(RNG_SEED + 1)
-        m_n_toy = 100
-        m_K = 5
+        md(r"""
+        ### 1.2 Traceability table: one row per method
 
-        # Generate true labels uniformly.
-        m_true_labels = m_np_rng.integers(0, m_K, m_n_toy)
-
-        # Generate predicted probabilities: mostly correct, some noise.
-        m_logits = m_np_rng.standard_normal((m_n_toy, m_K))
-        # Boost the correct class logit.
-        m_logits[np.arange(m_n_toy), m_true_labels] += 2.5
-        # Softmax.
-        m_max_logits = np.max(m_logits, axis=1, keepdims=True)
-        m_exp_logits = np.exp(m_logits - m_max_logits)
-        m_probs = m_exp_logits / np.sum(m_exp_logits, axis=1, keepdims=True)
-
-        # Check probabilities are valid.
-        m_valid_probs = np.all(m_probs >= 0) and np.all(m_probs <= 1) and np.allclose(m_probs.sum(axis=1), 1.0)
-        check("S1.1", m_valid_probs, f"Generated {m_n_toy} samples, {m_K} classes, probabilities sum to 1")
-
-        # Compute metrics.
-        m_nll_val = nll(m_probs, m_true_labels)
-        m_brier_val = brier_score(m_probs, m_true_labels)
-        m_ece_val = expected_calibration_error(m_probs, m_true_labels, bins=10)
-
-        print(f"Toy dataset (n={m_n_toy}, K={m_K}):")
-        print(f"  NLL = {m_nll_val:.4f}")
-        print(f"  Brier = {m_brier_val:.4f}")
-        print(f"  ECE (10 bins) = {m_ece_val:.4f}")
+        The project brief requires that every method borrowed from the literature can be traced from a claim in this
+        notebook back to the exact question and answer that supplied it. The table below is built from the answer
+        files themselves, not typed by hand. Each row records the paper, its arXiv id, the NotebookLM notebook id,
+        the session id and the turn numbers, and the literal `nlm-v2` command that re-reads the session. The local
+        response files. The cell that builds it also *verifies* that each file's recorded `conversation_id` equals the
+        session id and that each file's `sources_used` points at the intended paper's source id. Two further rows
+        (AutoClip, conformal risk control) come from other NotebookLM notebooks; their profile flag was not recorded in
+        the repository, and the conformal-risk-control notebook was retired, so its local files are the only copy.
         """),
 
-        code("""
-        # S1.2: Worked numeric example - perfect probabilities.
-        # When predicted probability equals observed frequency, metrics should be optimal.
-        m_n_perfect = 1000
-        m_K_perfect = 3
-        m_rng_perfect = np.random.default_rng(RNG_SEED + 12)
-
-        # Class distribution: 50%, 30%, 20%.
-        m_class_freqs = np.array([0.5, 0.3, 0.2])
-        m_perfect_labels = m_rng_perfect.choice(m_K_perfect, m_n_perfect, p=m_class_freqs)
-
-        # Perfect probabilities = class frequencies (repeated for each sample).
-        m_perfect_probs = np.tile(m_class_freqs[np.newaxis, :], (m_n_perfect, 1))
-
-        m_nll_perfect = nll(m_perfect_probs, m_perfect_labels)
-        m_brier_perfect = brier_score(m_perfect_probs, m_perfect_labels)
-        m_ece_perfect = expected_calibration_error(m_perfect_probs, m_perfect_labels, bins=10)
-
-        # NLL = -log(class_freq) averaged over the class distribution.
-        m_expected_nll = -np.sum(m_class_freqs * np.log(m_class_freqs))
-        m_nll_match = np.isclose(m_nll_perfect, m_expected_nll, rtol=0.05)
-        check("S1.2", m_nll_match, f"NLL (perfect) = {m_nll_perfect:.4f}, theory = {m_expected_nll:.4f}")
-
-        # Brier should be close to baseline uncertainty: sum of class_freq * (1 - class_freq).
-        # When predictions match class frequencies exactly, Brier ≈ uncertainty, not 0.
-        m_expected_brier_uncertainty = np.sum(m_class_freqs * (1 - m_class_freqs))
-        # With perfect calibration, Brier = Uncertainty (Reliability - Resolution ≈ 0).
-        m_brier_close = np.isclose(m_brier_perfect, m_expected_brier_uncertainty, rtol=0.15)
-        check("S1.3", m_brier_close, f"Brier (perfect) = {m_brier_perfect:.4f}, baseline uncertainty = {m_expected_brier_uncertainty:.4f}")
-
-        # ECE should be near zero for perfectly calibrated probabilities.
-        m_ece_small = m_ece_perfect < 0.05
-        check("S1.4", m_ece_small, f"ECE (perfect) = {m_ece_perfect:.4f}, near 0 (perfect calibration)")
-        """),
-
-        code("""
-        # S1.5: Proper scoring property — expected loss minimized at true probabilities.
-        # Monte Carlo test: sample predictions around the true class frequency.
-        m_true_prob_c0 = 0.4  # True probability of class 0.
-        m_K_proper = 2  # Binary for simplicity.
-        m_n_proper = 10000
-        m_rng_proper = np.random.default_rng(RNG_SEED + 15)
-
-        # Generate labels: 0 with probability 0.4, 1 with probability 0.6 (complement).
-        m_proper_labels = m_rng_proper.binomial(1, 1 - m_true_prob_c0, m_n_proper)
-
-        # Test a range of predicted probabilities for class 0.
-        m_test_probs = np.linspace(0.2, 0.8, 20)
-        m_nlls = []
-        for m_p in m_test_probs:
-            m_probs_test = np.column_stack([np.full(m_n_proper, m_p), np.full(m_n_proper, 1 - m_p)])
-            m_nlls.append(nll(m_probs_test, m_proper_labels))
-
-        # NLL should be minimized near the true class frequency (0.4 for class 0).
-        # Theory: E[NLL] = 0.4*(-log(p)) + 0.6*(-log(1-p)) minimized at p=0.4.
-        # Finite-sample empirical minimum: check within 3 standard errors of truth.
-        m_min_idx = np.argmin(m_nlls)
-        m_min_prob = m_test_probs[m_min_idx]
-        m_se_empirical = np.std(m_nlls) / np.sqrt(len(m_nlls))
-        m_tolerance = 3 * m_se_empirical
-        m_min_close_to_truth = abs(m_min_prob - m_true_prob_c0) <= m_tolerance
-        check("S1.5", m_min_close_to_truth, f"NLL min at p={m_min_prob:.3f}, truth p={m_true_prob_c0:.1f}, within {3:.1f} SE={m_tolerance:.4f}")
-
-        print(f"Proper scoring check: NLL empirical min at p={m_min_prob:.3f}, truth p={m_true_prob_c0}, tolerance={m_tolerance:.4f}")
-        """),
-
-        code("""
-        # S1.6: ECE bin count sensitivity with mixed-sign miscalibration.
-        # Create a DGP where confidence regions have opposite calibration errors.
-        m_rng_bins = np.random.default_rng(RNG_SEED + 16)
-        m_n_ece = 1000
-        m_K_ece = 2
-
-        # Create calibration data with systematic mixed-sign miscalibration:
-        # High logit magnitude -> overconfident (predict high, but ~40% error)
-        # Low logit magnitude -> underconfident (predict moderate, but ~95% accuracy)
-        m_true_ece = m_rng_bins.integers(0, m_K_ece, m_n_ece)
-        m_logits_ece = m_rng_bins.standard_normal((m_n_ece, m_K_ece))
-        m_magnitudes = np.sqrt(np.sum(m_logits_ece**2, axis=1))
-
-        # Low-magnitude samples: boost correct class (will be underconfident).
-        m_lo_mag_mask = m_magnitudes < np.median(m_magnitudes)
-        m_logits_ece[m_lo_mag_mask, m_true_ece[m_lo_mag_mask]] += 2.0
-
-        # High-magnitude samples: flip ~38% of labels (will be overconfident).
-        m_hi_mag_mask = ~m_lo_mag_mask
-        m_flip_count = int(0.38 * m_hi_mag_mask.sum())
-        m_flip_idx = m_rng_bins.choice(np.where(m_hi_mag_mask)[0], size=m_flip_count, replace=False)
-        m_true_ece[m_flip_idx] = 1 - m_true_ece[m_flip_idx]
-
-        m_max_ece = np.max(m_logits_ece, axis=1, keepdims=True)
-        m_exp_ece = np.exp(m_logits_ece - m_max_ece)
-        m_probs_ece = m_exp_ece / np.sum(m_exp_ece, axis=1, keepdims=True)
-
-        # Compute ECE over a range of bin counts.
-        m_bin_counts = [5, 10, 15, 20]
-        m_ece_vals = [expected_calibration_error(m_probs_ece, m_true_ece, bins=b) for b in m_bin_counts]
-
-        # Check: ECE shows variability across bin counts due to mixed-sign miscalibration.
-        m_ece_range = np.max(m_ece_vals) - np.min(m_ece_vals)
-        m_ece_spread = np.std(m_ece_vals)
-        m_ece_varies = m_ece_spread > 0.003  # Spread across bins confirms sensitivity.
-        check("S1.6", m_ece_varies, f"ECE varies with bin count: {[f'{v:.4f}' for v in m_ece_vals]}, spread={m_ece_spread:.4f}")
-
-        for m_bc, m_ev in zip(m_bin_counts, m_ece_vals):
-            print(f"  ECE (bins={m_bc:2d}): {m_ev:.4f}")
-        """),
-
-        # ─────────────────────────────────────────────────────────────────────────────────
-        # Reliability diagram and ECE visualization
-        # ─────────────────────────────────────────────────────────────────────────────────
-
-        code("""
-        # S1.7: Plot reliability diagrams for ECE across bin counts.
-        m_rng_plot = np.random.default_rng(RNG_SEED + 17)
-        m_n_plot = 1000
-        m_K_plot = 5
-
-        # Slightly overconfident model.
-        m_logits_plot = m_rng_plot.standard_normal((m_n_plot, m_K_plot))
-        m_true_plot = m_rng_plot.integers(0, m_K_plot, m_n_plot)
-        m_logits_plot[np.arange(m_n_plot), m_true_plot] += 1.8
-        m_max_plot = np.max(m_logits_plot, axis=1, keepdims=True)
-        m_exp_plot = np.exp(m_logits_plot - m_max_plot)
-        m_probs_plot = m_exp_plot / np.sum(m_exp_plot, axis=1, keepdims=True)
-
-        m_conf = np.max(m_probs_plot, axis=1)
-        m_correct = np.argmax(m_probs_plot, axis=1) == m_true_plot
-
-        # Reliability diagram: plot calibration across different bin counts.
-        m_fig, m_ax = plt.subplots(figsize=(8, 6))
-        m_ax.plot([0, 1], [0, 1], color=PALETTE["reference"], linestyle="--", linewidth=2, label="Perfect calibration")
-
-        m_bin_list = [10, 15, 20]
-        m_colors = [PALETTE["clean"], PALETTE["mask"], PALETTE["acoustic"]]
-
-        for m_nb, m_col in zip(m_bin_list, m_colors):
-            m_indices = np.minimum((m_conf * m_nb).astype(int), m_nb - 1)
-            m_xs, m_ys = [], []
-            for m_b in range(m_nb):
-                m_mask = m_indices == m_b
-                if np.any(m_mask):
-                    m_xs.append(m_conf[m_mask].mean())
-                    m_ys.append(m_correct[m_mask].mean())
-            m_ax.plot(m_xs, m_ys, marker="o", color=m_col, label=f"{m_nb} bins", linewidth=1.5)
-
-        m_ax.set_xlim([0, 1])
-        m_ax.set_ylim([0, 1])
-        m_ax.set_xlabel("Mean confidence (predicted max probability)", fontsize=11)
-        m_ax.set_ylabel("Empirical accuracy", fontsize=11)
-        m_ax.set_title("Reliability diagram: confidence vs. accuracy across bin counts", fontsize=12)
-        m_ax.legend(frameon=False, fontsize=10)
-        m_ax.grid(alpha=0.3)
-        m_fig.tight_layout()
-        plt.show()
-        """),
-
-        md("""
-        ### How to read this chart
-
-        The reliability diagram plots the relationship between predicted confidence (mean max-class probability in each bin) and empirical accuracy (fraction of correct predictions in that bin). The dashed diagonal line represents perfect calibration: when confidence equals accuracy, the model is well-calibrated on that bin.
-
-        **Axes:** The x-axis shows predicted confidence (ranging from 0 to 1), and the y-axis shows empirical accuracy (correct predictions as a fraction, ranging from 0 to 1).
-
-        **Lines:** Each colored line represents a different bin count (10, 15, 20 bins). Points above the diagonal indicate **underconfidence** (accuracy exceeds confidence; model is overly cautious). Points below the diagonal indicate **overconfidence** (confidence exceeds accuracy; model is overconfident).
-
-        **Interpretation:** In this chart, the model shows a mix of calibration errors. Different bin counts yield different point locations, illustrating the **bin-count sensitivity** weakness of ECE documented in Guo et al. 2017 (q9). With fewer bins, fluctuations within each bin are averaged; with more bins, finer regional miscalibration is exposed. The variation in ECE across bin counts (seen in the printed values above) confirms that ECE is not robust to bin count choice.
-
-        **Takeaway:** ECE is a rough measure of calibration, highly sensitive to bin count. The same model can appear well-calibrated under one binning and poorly calibrated under another. This sensitivity motivates other calibration metrics like adaptive ECE or continuous measures.
-        """),
-
-        code("""
-        # S1.8: Equal-mass binning as an alternative to equal-width binning.
-        # Equal-mass (decile) bins try to mitigate the empty-bin problem in equal-width.
-        m_rng_mass = np.random.default_rng(RNG_SEED + 18)
-        m_n_mass = 800
-        m_K_mass = 4
-
-        m_logits_mass = m_rng_mass.standard_normal((m_n_mass, m_K_mass))
-        m_y_mass = m_rng_mass.integers(0, m_K_mass, m_n_mass)
-        m_logits_mass[np.arange(m_n_mass), m_y_mass] += 1.5
-        m_max_mass = np.max(m_logits_mass, axis=1, keepdims=True)
-        m_exp_mass = np.exp(m_logits_mass - m_max_mass)
-        m_probs_mass = m_exp_mass / np.sum(m_exp_mass, axis=1, keepdims=True)
-
-        m_conf_mass = np.max(m_probs_mass, axis=1)
-        m_correct_mass = np.argmax(m_probs_mass, axis=1) == m_y_mass
-
-        # Equal-width binning.
-        m_n_bins_ew = 10
-        m_indices_ew = np.minimum((m_conf_mass * m_n_bins_ew).astype(int), m_n_bins_ew - 1)
-        m_ece_ew = 0.0
-        m_empty_bins_ew = 0
-        for m_b in range(m_n_bins_ew):
-            m_mask = m_indices_ew == m_b
-            if np.any(m_mask):
-                m_ece_ew += (m_mask.mean()) * abs(m_conf_mass[m_mask].mean() - m_correct_mass[m_mask].mean())
-            else:
-                m_empty_bins_ew += 1
-
-        # Equal-mass (quantile-based) binning: put approximately equal sample counts per bin.
-        m_n_bins_eq = 10
-        m_quantiles = np.linspace(0, 1, m_n_bins_eq + 1)
-        m_bin_edges = np.quantile(m_conf_mass, m_quantiles)
-        m_indices_eq = np.searchsorted(m_bin_edges[1:-1], m_conf_mass, side='right')
-        m_ece_eq = 0.0
-        for m_b in range(m_n_bins_eq):
-            m_mask = m_indices_eq == m_b
-            if np.any(m_mask):
-                m_ece_eq += (m_mask.mean()) * abs(m_conf_mass[m_mask].mean() - m_correct_mass[m_mask].mean())
-
-        m_ece_diff = abs(m_ece_ew - m_ece_eq)
-        check("S1.8", m_ece_diff < 0.15, f"Equal-width ECE={m_ece_ew:.4f}, equal-mass ECE={m_ece_eq:.4f}, diff={m_ece_diff:.4f}, empty_bins={m_empty_bins_ew}")
-
-        print(f"ECE binning comparison (n={m_n_mass}):")
-        print(f"  Equal-width (10 bins): ECE={m_ece_ew:.4f}, empty bins={m_empty_bins_ew}")
-        print(f"  Equal-mass (decile):   ECE={m_ece_eq:.4f}, empty bins=0")
-        """),
-
-        code("""
-        # S1.9: Verify that binning computations are consistent.
-        # Equal-mass and equal-width should both be valid even if they differ.
-        m_both_valid = (m_ece_ew >= 0 and m_ece_ew <= 1) and (m_ece_eq >= 0 and m_ece_eq <= 1)
-        note("S1.9", f"Both binning methods produced valid ECE values in [0, 1]: equal-width={m_ece_ew:.4f}, equal-mass={m_ece_eq:.4f}")
-        """),
-
-        # ─────────────────────────────────────────────────────────────────────────────────
-        # Section 2: Temperature scaling (derived here; q10)
-        # ─────────────────────────────────────────────────────────────────────────────────
-
-        md("""
-        ## 2. Temperature scaling as one-parameter maximum likelihood (derived here; q10)
-
-        Temperature scaling is a simple post-hoc calibration method that divides logits by a learned positive scalar $T$ before softmax:
-
-        $$p_i(k; T) = \\frac{\\exp(z_i(k) / T)}{\\sum_j \\exp(z_i(j) / T)}$$
-
-        where $z_i$ are raw logits (pre-softmax outputs).
-
-        **Derivation as Maximum Likelihood:** Given a calibration set with logits $\\{z_i\\}$ and labels $\\{y_i\\}$, we choose $T$ to minimize NLL on the calibration set:
-
-        $$T^* = \\arg\\min_T \\text{NLL}(T) = \\arg\\min_T \\left( -\\frac{1}{n} \\sum_{i=1}^n \\log p_i(y_i; T) \\right)$$
-
-        The objective $\\text{NLL}(T)$ is convex in $1/T$ (shown below), so this has a unique minimum. Once $T^*$ is fitted on the calibration set, it is applied to all test data.
-
-        **Key insight (q10 protocol):** $T$ is fitted **only on the calibration split**, not on the test split. Fitting on the test split would cause overfitting and optimistic bias, invalidating all confidence guarantees.
-
-        **Properties:**
-        - **Argmax invariance:** $\\arg\\max_k p_i(k; T) = \\arg\\max_k p_i(k; 1)$ for any $T > 0$. Accuracy is unchanged.
-        - **Calibration refinement:** NLL and ECE can improve or degrade depending on the initial miscalibration.
-        - **Cannot fix input-region miscalibration:** If a model is overconfident on class $j$ and underconfident on class $k$, a single global $T$ cannot correct both simultaneously (negative result).
-
-        **Negative result documented:** We will show that temperature scaling fails when miscalibration depends on the input region or class identity.
-        """),
-
-        code("""
-        # S2.0: Verification that calibration module is loaded and functional.
-        m_test_logits = np.random.default_rng(RNG_SEED + 20).standard_normal((50, 3))
-        m_test_labels = np.random.default_rng(RNG_SEED + 20).integers(0, 3, 50)
-        try:
-            m_T_test_load = temperature_scale(m_test_logits, m_test_labels)
-            m_calib_load_ok = m_T_test_load > 0
-            check("S2.0", m_calib_load_ok, f"temperature_scale loaded successfully, T={m_T_test_load:.4f}")
-        except Exception as m_e:
-            check("S2.0", False, f"temperature_scale failed: {m_e}")
-
-        # S2.1: Fit temperature scaling on calibration split; measure accuracy and NLL on test split.
-        m_rng_temp = np.random.default_rng(RNG_SEED + 21)
-        m_n_cal = 150
-        m_n_test_temp = 150
-        m_K_temp = 4
-
-        # Generate calibration split.
-        m_z_cal = m_rng_temp.standard_normal((m_n_cal, m_K_temp))
-        m_y_cal = m_rng_temp.integers(0, m_K_temp, m_n_cal)
-        m_z_cal[np.arange(m_n_cal), m_y_cal] += 2.0  # Boost correct class.
-
-        # Generate test split (independent, same distribution).
-        m_z_test = m_rng_temp.standard_normal((m_n_test_temp, m_K_temp))
-        m_y_test = m_rng_temp.integers(0, m_K_temp, m_n_test_temp)
-        m_z_test[np.arange(m_n_test_temp), m_y_test] += 2.0
-
-        # Fit temperature on calibration split.
-        m_T_fitted = temperature_scale(m_z_cal, m_y_cal)
-
-        # Convert logits to probabilities.
-        def m_softmax(m_logits, m_temp=1.0):
-            m_shifted = m_logits - np.max(m_logits, axis=1, keepdims=True)
-            m_exp = np.exp(m_shifted / m_temp)
-            return m_exp / np.sum(m_exp, axis=1, keepdims=True)
-
-        m_p_test_uncal = m_softmax(m_z_test, m_temp=1.0)
-        m_p_test_cal = m_softmax(m_z_test, m_temp=m_T_fitted)
-
-        # Metrics on test split (uncalibrated vs. calibrated).
-        m_acc_uncal = np.mean(np.argmax(m_p_test_uncal, axis=1) == m_y_test)
-        m_acc_cal = np.mean(np.argmax(m_p_test_cal, axis=1) == m_y_test)
-        m_nll_uncal = nll(m_p_test_uncal, m_y_test)
-        m_nll_cal = nll(m_p_test_cal, m_y_test)
-        m_ece_uncal = expected_calibration_error(m_p_test_uncal, m_y_test, bins=10)
-        m_ece_cal = expected_calibration_error(m_p_test_cal, m_y_test, bins=10)
-
-        # Check: accuracy should be unchanged (argmax invariance).
-        m_acc_unchanged = np.isclose(m_acc_uncal, m_acc_cal)
-        check("S2.1", m_acc_unchanged, f"Accuracy unchanged: uncal={m_acc_uncal:.3f}, cal={m_acc_cal:.3f}, T={m_T_fitted:.3f}")
-
-        print(f"Temperature scaling results:")
-        print(f"  Fitted T = {m_T_fitted:.4f}")
-        print(f"  Accuracy: uncalibrated={m_acc_uncal:.4f}, calibrated={m_acc_cal:.4f} (unchanged)")
-        print(f"  NLL:      uncalibrated={m_nll_uncal:.4f}, calibrated={m_nll_cal:.4f}")
-        print(f"  ECE:      uncalibrated={m_ece_uncal:.4f}, calibrated={m_ece_cal:.4f}")
-        """),
-
-        code("""
-        # S2.2: Demonstrate calibration-split vs test-split leakage (O(1/n) effect).
-        # Proper protocol (S2.1): fit T on calibration split, evaluate on test split.
-        # Violation: fit T on test split → optimistic bias.
-        m_T_test = temperature_scale(m_z_test, m_y_test)  # WRONG: data leakage.
-        m_p_test_leaked = m_softmax(m_z_test, m_temp=m_T_test)
-        m_nll_leaked = nll(m_p_test_leaked, m_y_test)
-
-        # The proper fit (S2.1) was on calibration split and evaluated on independent test split.
-        # The leaked fit is on the test split itself, creating optimistic bias ~O(1/n).
-        # Evaluation is always on test split; the difference is where T was fitted.
-        m_nll_diff = m_nll_cal - m_nll_leaked
-        m_leakage_detected = m_nll_diff > 0.01  # O(1/n) gap should be visible with n~150.
-        check("S2.2", m_leakage_detected, f"Cal-split-fit (proper) NLL={m_nll_cal:.4f}, test-split-fit (leaked) NLL={m_nll_leaked:.4f}, gap={m_nll_diff:.4f}")
-
-        print(f"Data leakage (evaluated on test split):")
-        print(f"  T fitted on calibration split: T={m_T_fitted:.4f}, NLL={m_nll_cal:.4f} (proper)")
-        print(f"  T fitted on test split:        T={m_T_test:.4f}, NLL={m_nll_leaked:.4f} (leakage, optimistic bias ~O(1/n))")
-        print(f"  Bias: {m_nll_diff:.4f}")
-        """),
-
-        code("""
-        # S2.3: NLL convex in 1/T — verify objective has unique minimum.
-        # NLL is convex in 1/T (inverse temperature); compute it across a range of T values.
-        m_temps = np.linspace(0.1, 3.0, 50)
-        m_inverse_temps = 1.0 / m_temps
-        m_nlls_by_temp = []
-
-        for m_t in m_temps:
-            m_p_t = m_softmax(m_z_cal, m_temp=m_t)
-            m_nll_t = nll(m_p_t, m_y_cal)
-            m_nlls_by_temp.append(m_nll_t)
-
-        m_min_nll_idx = np.argmin(m_nlls_by_temp)
-        m_optimal_temp_from_plot = m_temps[m_min_nll_idx]
-
-        # Check: minimum found is close to fitted T.
-        m_temps_match = np.isclose(m_optimal_temp_from_plot, m_T_fitted, rtol=0.1)
-        check("S2.3", m_temps_match, f"Minimum NLL at T={m_optimal_temp_from_plot:.4f}, fitted T={m_T_fitted:.4f}")
-
-        print(f"Convexity check: NLL minimum at T={m_optimal_temp_from_plot:.4f} (NLL convex in 1/T)")
-        """),
-
-        code("""
-        # S2.4: Plot NLL vs. temperature to show convexity and optimal point.
-        m_fig2, m_ax2 = plt.subplots(figsize=(8, 5.5))
-        m_ax2.plot(m_temps, m_nlls_by_temp, color=PALETTE["clean"], linewidth=2.5, label="NLL on calibration set")
-        m_ax2.axvline(m_optimal_temp_from_plot, color=PALETTE["acoustic"], linestyle="--", linewidth=2, label=f"Optimal T={m_optimal_temp_from_plot:.3f}")
-        m_ax2.scatter([m_optimal_temp_from_plot], [m_nlls_by_temp[m_min_nll_idx]], color=PALETTE["acoustic"], s=100, zorder=5)
-        m_ax2.set_xlabel("Temperature T", fontsize=11)
-        m_ax2.set_ylabel("NLL on calibration split", fontsize=11)
-        m_ax2.set_title("Temperature scaling: NLL is convex in 1/T", fontsize=12)
-        m_ax2.legend(frameon=False, fontsize=10)
-        m_ax2.grid(alpha=0.3)
-        m_fig2.tight_layout()
-        plt.show()
-        """),
-
-        md("""
-        ### How to read this chart
-
-        This plot shows how NLL (Negative Log-Likelihood) varies as a function of the temperature parameter $T$. The x-axis represents $T$ directly, and the y-axis shows NLL on the calibration split.
-
-        **Axes:** The x-axis is $T$ (temperature), ranging from 0.1 to 3.0. The y-axis is NLL, ranging from the minimum value upward.
-
-        **Curve shape:** The curve shows a clear **U-shape** with a single unique minimum. NLL is **convex in $1/T$** (the inverse of temperature), guaranteeing that the optimization problem has a unique global optimum with no spurious local minima.
-
-        **Marked point:** The red dashed vertical line and scatter point indicate the optimal $T$ value that minimizes NLL on the calibration set. This is the temperature value returned by the fitting procedure.
-
-        **Interpretation:** The U-shape confirms temperature scaling has a unique optimal value. Moving temperature away from this optimum in either direction (toward 0 or toward infinity) monotonically increases NLL. The width and steepness of the minimum reflect how sensitive the calibration is to temperature choice.
-
-        **Takeaway:** Temperature is a one-parameter MLE fit. Convexity in $1/T$ ensures we can find the global optimum reliably via any reasonable numerical optimization method.
-        """),
-
-        code("""
-        # S2.5: Negative result — temperature scaling cannot fix region-dependent miscalibration.
-        # Construct calibration set with mixed calibration: low-conf underconfident, high-conf overconfident.
-        m_rng_neg = np.random.default_rng(RNG_SEED + 25)
-        m_n_neg = 600
-
-        # Generate labels uniformly, then create miscalibrated logits.
-        m_y_neg = m_rng_neg.integers(0, 2, m_n_neg)
-
-        # Construct logits with region-dependent miscalibration.
-        m_z_neg = m_rng_neg.standard_normal((m_n_neg, 2))
-
-        # First half: weak signal (underconfident, accuracy will exceed confidence).
-        m_lo_idx = np.arange(m_n_neg // 2)
-        m_z_neg[m_lo_idx, m_y_neg[m_lo_idx]] += 1.0  # Weak boost for true class
-
-        # Second half: strong signal, but then flip ~40% of labels (overconfident).
-        m_hi_idx = np.arange(m_n_neg // 2, m_n_neg)
-        m_z_neg[m_hi_idx, m_y_neg[m_hi_idx]] += 2.5  # Strong boost for true class
-        m_flip_count = int(0.4 * len(m_hi_idx))
-        m_flip_positions = m_rng_neg.choice(m_hi_idx, size=m_flip_count, replace=False)
-        m_y_neg[m_flip_positions] = 1 - m_y_neg[m_flip_positions]  # Flip labels
-
-        # Fit a single global temperature.
-        m_T_neg = temperature_scale(m_z_neg, m_y_neg)
-
-        # Evaluate, binned by predicted confidence (quantile-based).
-        m_p_neg = m_softmax(m_z_neg, m_temp=m_T_neg)
-        m_conf_neg = np.max(m_p_neg, axis=1)
-        m_correct_neg = np.argmax(m_p_neg, axis=1) == m_y_neg
-
-        # Bin by confidence percentile: low (0-40th), mid (40-60th), high (60-100th).
-        m_conf_q40 = np.percentile(m_conf_neg, 40)
-        m_conf_q60 = np.percentile(m_conf_neg, 60)
-
-        m_bins = [
-            (m_conf_neg < m_conf_q40, "low"),
-            ((m_conf_neg >= m_conf_q40) & (m_conf_neg < m_conf_q60), "mid"),
-            (m_conf_neg >= m_conf_q60, "high"),
+        code(r"""
+        # N1.1.3: the traceability table. Values are literals, recorded when the sessions were run.
+        NB_ID, SESSION = "68e9e8f3-5322-42de-a322-d82c29e608e6", "1aa89a2b-3d31-40a7-b0de-a73c84aa491e"
+        CMD = f"nlm-v2 chats get {NB_ID} {SESSION} --profile <profile>"
+        SIG_ID, SIG_SESSION = "2913ec1e-1959-4d17-9d9d-f4069a8fd05b", "41fd1df2-c197-4611-b554-42f27b4758db"
+        rows = [
+            {"method": "Recurrent over convolutional (CRNN)", "paper": "Arik et al., CRNN for Small-Footprint Keyword Spotting",
+             "arXiv": "1703.05390", "notebook id": NB_ID, "session id": SESSION, "turns": "1-3", "re-read command": CMD},
+            {"method": "Neural collapse (NC1, NC2, TPT)", "paper": "Papyan, Han, Donoho, Prevalence of Neural Collapse",
+             "arXiv": "2008.08186", "notebook id": NB_ID, "session id": SESSION, "turns": "4-6", "re-read command": CMD},
+            {"method": "Calibration (MDCA)", "paper": "Hebbalaguppe et al., A Stitch in Time Saves Nine",
+             "arXiv": "2203.13834", "notebook id": NB_ID, "session id": SESSION, "turns": "7-8", "re-read command": CMD},
+            {"method": "Adaptive gradient clipping (AutoClip)", "paper": "Seetharaman et al., AutoClip",
+             "arXiv": "2007.14469", "notebook id": SIG_ID, "session id": SIG_SESSION, "turns": "5-8",
+             "re-read command": f"nlm-v2 chats get {SIG_ID} {SIG_SESSION} --profile <profile>"},
+            {"method": "Conformal risk control (CRC)", "paper": "Angelopoulos et al., Conformal Risk Control",
+             "arXiv": "2208.02814", "notebook id": "retired", "session id": "retired", "turns": "2-3",
+             "re-read command": "n/a: that source notebook was deleted (one of its three sources never ingested)"},
         ]
-
-        m_gaps = []
-        for m_mask, m_label in m_bins:
-            if np.any(m_mask):
-                m_conf_bin = m_conf_neg[m_mask].mean()
-                m_acc_bin = m_correct_neg[m_mask].mean()
-                m_gap = abs(m_conf_bin - m_acc_bin)
-                m_gaps.append(m_gap)
-
-        # Check: spread of gaps across confidence bins indicates region-dependent error.
-        m_gap_spread = np.max(m_gaps) - np.min(m_gaps) if len(m_gaps) > 1 else 0
-        m_misaligned = m_gap_spread > 0.05  # Significant spread indicates persistent miscalibration.
-
-        check("S2.5", m_misaligned, f"Confidence-binned gaps show spread: gaps={[f'{g:.3f}' for g in m_gaps]}, spread={m_gap_spread:.3f}")
-
-        print(f"Negative result — region-dependent miscalibration persists with single T:")
-        for (m_mask, m_label), m_gap in zip(m_bins, m_gaps):
-            m_conf_bin = m_conf_neg[m_mask].mean()
-            m_acc_bin = m_correct_neg[m_mask].mean()
-            print(f"  {m_label:3s}-confidence: conf={m_conf_bin:.3f}, acc={m_acc_bin:.3f}, gap={m_gap:.3f}")
-        print(f"  T={m_T_neg:.3f} cannot simultaneously fix all confidence regions.")
+        TRACE = pd.DataFrame(rows)
+        with pd.option_context("display.max_colwidth", 200, "display.width", 300):
+            display(TRACE[["method", "arXiv", "notebook id", "session id", "turns"]])
+        print()
+        for _, r in TRACE.iterrows():
+            print(f"{r['arXiv']:>10s}  turns {r['turns']:>3s}  {r['re-read command']}")
+        check("N1.1.3a", len(TRACE) == 5 and TRACE["arXiv"].is_unique, "five methods, five distinct papers")
+        check("N1.1.3b", (TRACE.iloc[:3]["session id"] == SESSION).all(),
+              "the three papers sourced for this notebook share one notebook id and one session id")
+        check("N1.1.3c", TRACE.iloc[4]["notebook id"] == "retired",
+              "the CRC row is marked retired: its source notebook was deleted after one of its three sources was found never to have ingested")
+        note("N1.1.3", "the raw NotebookLM answers live in a private research workspace and are not published with this "
+                       "repository; the ids, session and turn numbers above are what make the citations checkable by "
+                       "whoever holds that workspace")
         """),
 
-        code("""
-        # S2.7: Summary of temperature scaling findings.
-        # Verify that all core results hold: accuracy invariance, NLL improvement possible, region-dependent miscalibration.
-        m_summary_ok = m_acc_unchanged and m_temps_match and m_misaligned
-        check("S2.7", m_summary_ok, "Temperature scaling: invariant accuracy, convex objective, region-dependent calibration limits")
-        print()
-        check_summary()
+        md(r"""
+        ### 1.3 What the traceability table does and does not guarantee
+
+        The table above records, for each method, the paper it comes from and the exact conversation turn its numbers
+        were read out of. While this notebook was being written, every literature figure quoted in Sections 2, 4, 5 and
+        6 was checked verbatim against the stored answer for that turn -- 229k and 250k parameters, the 4.31 / 5.73 and
+        2.85 / 3.77 false-rejection rates, the 97.71 / 98.71 / 99.30 accuracies, the MDCA ECE figures 7.77 / 6.10 /
+        7.69 / 4.66, the WSJ0-2mix setting for AutoClip's $p = 10$, and the terminal-phase and training-set conditions
+        on neural collapse.
+
+        **That check is not reproducible from this repository, and it would be dishonest to imply otherwise.** The raw
+        answers are not published here, so a reader cannot re-run the comparison; what they can do is re-read the
+        sessions with the commands above, given access to that workspace, or go to the arXiv papers directly. Every
+        literature number in this notebook is attributed to a specific turn precisely so that it can be audited at the
+        source rather than taken on trust.
+        """),
+
+        md(r"""
+        ## 2. Recurrent over convolutional: what global average pooling throws away
+
+        ### 2.1 The invariance, stated exactly
+
+        Let a convolutional trunk produce a feature map $F\in\mathbb{R}^{C\times T}$ (after the mel axis has been
+        reduced), with column $F_{:,t}\in\mathbb{R}^C$ the feature vector at frame $t$. Global average pooling over the
+        time axis is
+        $$g(F)=\frac{1}{T}\sum_{t=1}^{T}F_{:,t}=\frac{1}{T}F\mathbf{1}_T .$$
+        For any $T\times T$ permutation matrix $P$ we have $P\mathbf{1}_T=\mathbf{1}_T$, hence
+        $$g(FP)=\frac{1}{T}FP\mathbf{1}_T=\frac{1}{T}F\mathbf{1}_T=g(F).$$
+        Any classifier $h$ that sits on top therefore satisfies $h(g(FP))=h(g(F))$ for all $P$: the head is a function
+        of the *empirical distribution of frame features* $\hat\mu_F=\frac{1}{T}\sum_t\delta_{F_{:,t}}$, and in fact
+        only of its mean. Of the $T!$ orderings of the same frames, exactly one output survives. By the data-processing
+        inequality $I(Y;g(F))\le I(Y;F)$, and the inequality is strict whenever the label depends on the order of the
+        frames. The project's confusable keyword pairs (`no`/`on`, `go`/`no`, `up`/`off`) are exactly such cases:
+        they are close to anagrams at the level of a phoneme inventory and differ mainly in phoneme order.
+
+        **What survives.** The trunk is not order-blind before the pool: a stack of $L$ convolutions with kernel
+        width $k_\ell$ and strides $s_\ell$ has a temporal receptive field $r_L$ given by the recurrence
+        $$r_\ell=r_{\ell-1}+(k_\ell-1)\,j_{\ell-1},\qquad j_\ell=j_{\ell-1}s_\ell,\qquad r_0=j_0=1 .$$
+        Order *inside* one receptive field is encoded in the feature; order *between* receptive fields is not, once
+        $g$ has averaged them. So global average pooling turns the model into a bag of local $r_L$-frame patterns.
+
+        ### 2.2 Why a recurrent head preserves order
+
+        A gated recurrent unit updates a hidden state by
+        $$z_t=\sigma(W_zx_t+U_zh_{t-1}),\quad r_t=\sigma(W_rx_t+U_rh_{t-1}),$$
+        $$\tilde h_t=\tanh\big(W_hx_t+U_h(r_t\odot h_{t-1})\big),\qquad h_t=(1-z_t)\odot h_{t-1}+z_t\odot\tilde h_t .$$
+        Because $h_t=\Phi(h_{t-1},x_t)$ composes the same map $T$ times, $h_T=\Phi_{x_T}\circ\cdots\circ\Phi_{x_1}(h_0)$,
+        and function composition does not commute. For two frames $a,b$ we generally have
+        $\Phi_b\circ\Phi_a\neq\Phi_a\circ\Phi_b$, so $h$ distinguishes the sequence $(a,b)$ from $(b,a)$ even though
+        their frame means coincide. The project's `ConvGRU` applies a *bidirectional* GRU and then averages the
+        hidden states over time, $\bar h=\frac{1}{T}\sum_t[\overrightarrow{h}_t;\overleftarrow{h}_t]$. The mean is still
+        there, but it is taken *after* the recurrence: each $h_t$ already depends on the prefix (forward) and suffix
+        (backward), so $\bar h$ is not permutation invariant in the input frames. The order information is written
+        into the states before the pool sees them. The temporal receptive field is also the whole clip rather than
+        $r_L$ frames, which is the paper's point that pure CNNs "would need very wide filters or great depth" for
+        frame-wide context (Arik et al., arXiv:1703.05390, turn 3).
+
+        The next cells check each claim on the project's own module definitions with **untrained, seeded weights**:
+        the statements are structural, so they must hold for any weights, and untrained weights make that visible.
+        """),
+
+        code(r"""
+        # N1.2.1: instantiate the project's real architectures (no training) and count parameters.
+        import torch
+        from src.models import LogMelCNN, TimePoolCNN, WideCNN, ConvGRU
+        torch.manual_seed(RNG_SEED % 10_000)
+        MODELS = {"baseline": LogMelCNN().eval(), "timepool": TimePoolCNN().eval(), "wide": WideCNN().eval(), "gru": ConvGRU().eval()}
+        count = {k: sum(p.numel() for p in m.parameters()) for k, m in MODELS.items()}
+        print("parameter counts from src.models:", count)
+        check("N1.2.1a", count["baseline"] == 14524, f"LogMelCNN has {count['baseline']:,} parameters (the legacy baseline)")
+        check("N1.2.1b", count["gru"] == 291564 == DATA["gru"]["res"]["parameters"], f"ConvGRU has {count['gru']:,} parameters, matching arch-gru.result.json")
+        check("N1.2.1c", count["wide"] == 271692 == DATA["wide"]["res"]["parameters"], f"WideCNN has {count['wide']:,} parameters, matching arch-wide.result.json")
+        check("N1.2.1d", count["timepool"] == 17212 == DATA["timepool"]["res"]["parameters"], f"TimePoolCNN has {count['timepool']:,} parameters, matching arch-timepool.result.json")
+        # Analytic temporal receptive field of LogMelCNN's trunk: conv3, maxpool2, conv3, conv3 (time axis).
+        layers = [(3, 1), (2, 2), (3, 1), (3, 1)]
+        r, j = 1, 1
+        for k, s in layers:
+            r, j = r + (k - 1) * j, j * s
+        print(f"analytic time receptive field of the LogMelCNN trunk: {r} frames (hop 10 ms -> {r * 10} ms plus the 25 ms STFT window)")
+        # Empirical check with autograd: which input frames influence one central pre-pool activation?
+        x = torch.randn(1, 1, 40, 101, requires_grad=True)
+        trunk = MODELS["baseline"].features[:-1]
+        used = np.zeros(101, dtype=bool)
+        for seed in range(6):
+            torch.manual_seed(seed); m2 = LogMelCNN().eval(); trunk2 = m2.features[:-1]
+            x = torch.randn(1, 1, 40, 101, requires_grad=True)
+            out = trunk2(x); out[0, :, 10, out.shape[-1] // 2].sum().backward()
+            used |= (x.grad.abs().sum(dim=(0, 1, 2)) > 0).numpy()
+        rf_emp = int(used.sum())
+        check("N1.2.1e", rf_emp <= r + 1 and rf_emp >= r - 4, f"autograd receptive field {rf_emp} frames vs analytic {r} (ReLU can zero a few edge taps)")
+        check("N1.2.1f", rf_emp < 101 // 4, f"the trunk's temporal receptive field ({rf_emp} frames) is far shorter than a 101-frame clip: order between distant patterns is only visible to the head")
+        """),
+
+        code(r"""
+        # N1.2.2: order sensitivity of three heads on a permuted pre-pool feature map. Fixture: random inputs, untrained seeded weights.
+        def rel_change(y, yp):
+            return float((y - yp).flatten(1).norm(dim=1).div(y.flatten(1).norm(dim=1)).mean())
+
+        rng = np.random.default_rng(RNG_SEED + 1)
+        res = {"global average pool\n(LogMelCNN head)": [], "8 time-slot pool\n(TimePoolCNN head)": [], "BiGRU + mean\n(ConvGRU head)": []}
+        for trial in range(40):
+            x = torch.randn(4, 1, 40, 101)
+            with torch.no_grad():
+                f_b = MODELS["baseline"].features[:-1](x)                     # (B, 32, 20, 50)
+                perm_b = torch.as_tensor(rng.permutation(f_b.shape[-1]))
+                res["global average pool\n(LogMelCNN head)"].append(rel_change(MODELS["baseline"].features[-1](f_b), MODELS["baseline"].features[-1](f_b[..., perm_b])))
+                f_t = MODELS["timepool"].features[:-1](x)
+                perm_t = torch.as_tensor(rng.permutation(f_t.shape[-1]))
+                res["8 time-slot pool\n(TimePoolCNN head)"].append(rel_change(MODELS["timepool"].features[-1](f_t), MODELS["timepool"].features[-1](f_t[..., perm_t])))
+                g = MODELS["gru"]; conv = g.features(x); B_, C_, M_, T_ = conv.shape
+                seq = conv.permute(0, 3, 1, 2).reshape(B_, T_, C_ * M_)
+                perm_g = torch.as_tensor(rng.permutation(T_))
+                y0 = g.gru(seq)[0].mean(dim=1); y1 = g.gru(seq[:, perm_g])[0].mean(dim=1)
+                res["BiGRU + mean\n(ConvGRU head)"].append(rel_change(y0, y1))
+        RC = {k: np.array(v) for k, v in res.items()}
+        for k, v in RC.items():
+            print(f"{k.replace(chr(10), ' '):42s} mean relative change under a random frame permutation = {v.mean():.3e}  (sd {v.std(ddof=1):.2e})")
+        k_gap, k_ts, k_gru = list(RC)
+        check("N1.2.2a", RC[k_gap].max() < 1e-5, f"global average pooling is exactly permutation invariant up to float rounding (max relative change {RC[k_gap].max():.2e})")
+        check("N1.2.2b", RC[k_ts].mean() > 1e-2, f"the 8-slot pool is order sensitive (mean relative change {RC[k_ts].mean():.3f})")
+        check("N1.2.2c", RC[k_gru].mean() > 1e-2, f"the BiGRU head is order sensitive (mean relative change {RC[k_gru].mean():.3f})")
+        check("N1.2.2d", RC[k_gap].mean() * 1e3 < RC[k_ts].mean() and RC[k_gap].mean() * 1e3 < RC[k_gru].mean(), "order sensitivity of both time-preserving heads exceeds the pooled head by more than three orders of magnitude")
+        """),
+
+        code(r"""
+        # Figure 2.1: order sensitivity of the three heads (log scale so the pooled head's rounding-level value is visible).
+        fig, ax = plt.subplots(figsize=(8.4, 4.2))
+        labels = list(RC); means = [max(RC[k].mean(), 1e-9) for k in labels]; sds = [RC[k].std(ddof=1) for k in labels]
+        cols = [ACOL["baseline"], ACOL["timepool"], ACOL["gru"]]
+        ax.bar(range(3), means, yerr=[np.minimum(s, 0.9 * m) for s, m in zip(sds, means)], color=cols, capsize=4)
+        ax.set_yscale("log"); ax.set_xticks(range(3)); ax.set_xticklabels(labels, fontsize=9)
+        ax.set_ylabel("mean relative change of head output\nunder a random frame permutation (log)")
+        for i, m in enumerate(means):
+            ax.text(i, m * 1.5, f"{m:.1e}", ha="center", fontsize=9)
+        ax.set_title("Order sensitivity of the head (untrained seeded weights, random inputs, 40 trials)")
+        varied("N1.2.f1", means)
+        savefig(fig, "fig2_1_order_sensitivity.png")
+        """),
+
+        md(r"""
+        ### How to read this chart
+
+        Each bar is the average relative change $\lVert y-y_\pi\rVert/\lVert y\rVert$ of a head's output when the
+        *same* frames are fed in a random order $\pi$, on a log axis; whiskers are one standard deviation over 40
+        trials. The left bar (global average pooling) sits at floating-point rounding, about $10^{-8}$: not "small" but
+        exactly zero in exact arithmetic, as $g(FP)=g(F)$ predicts. The two right-hand bars are order-sensitive by many
+        orders of magnitude. The takeaway is structural: a head that averages over time before any state is formed
+        cannot see order, and a head that forms states first can. What would falsify the reading: a pooled bar far above
+        rounding error, or a recurrent bar at rounding error. Caution: this shows that order *can* influence the
+        output, not that the trained model *uses* it; that would need trained weights and is outside this notebook.
+        """),
+
+        md(r"""
+        ### 2.3 Paper result versus our result
+
+        The CRNN paper (Arik et al., arXiv:1703.05390; turns 1 to 3) reports a $229\text{k}$-parameter CRNN against a
+        re-optimised purely convolutional baseline capped at $250\text{k}$ parameters. At $5$ dB SNR the CNN baseline
+        has a false-reject rate of $4.31\%$ at 1 false alarm per hour and $5.73\%$ at $0.5$ per hour, against
+        $2.85\%$ and $3.79\%$ for the CRNN. The ratio is
+        $$\frac{\mathrm{FRR}_{\mathrm{CNN}}}{\mathrm{FRR}_{\mathrm{CRNN}}}=\frac{4.31}{2.85}=1.512,\qquad \frac{5.73}{3.79}=1.512,$$
+        i.e. the CNN's rate is about $51\%$ higher at both operating points. Two features make our comparison
+        different in kind. (i) The footprint classes are comparable, not equal: the paper's models bracket
+        $229\text{k}\to250\text{k}$ (ratio CRNN to CNN $=0.916$), ours are $291{,}564$ against $271{,}692$ (ratio
+        $=1.073$), so *our recurrent model is the larger one*, whereas the paper's is the smaller. (ii) The metrics
+        differ: FRR at a fixed false-alarm rate is a detection metric on a keyword-versus-background task, while ours
+        is 12-way accuracy. We therefore compare *error ratios*, $\rho=\mathrm{err}_{\text{conv}}/\mathrm{err}_{\text{rec}}$,
+        with error $=1-\text{accuracy}$, and treat the comparison as a shape check, not a replication.
+
+        Our margin is much smaller against the like-for-like convolutional arm. With $\mathrm{err}=1-\mathrm{acc}$,
+        $\rho_{\text{wide/gru}}=(1-0.8790)/(1-0.9008)=1.22$ at the best epoch, comparable in order of magnitude to
+        the paper's $1.51$ but resting on a difference of $0.0218$ that a $504$-clip validation split cannot separate
+        (its binomial standard error is about $0.013$ per arm). The other ratios, $\rho_{\text{timepool/gru}}$ and
+        $\rho_{\text{baseline/gru}}$, are far larger, because those arms *pool the time axis away*, which is the
+        mechanism of Section 2.1, not a footprint effect.
+        """),
+
+        code(r"""
+        # N1.2.3: paper error ratios vs ours, computed from the quoted paper figures and the loaded artifacts.
+        paper = {"5dB@1FA/h": (4.31, 2.85), "5dB@0.5FA/h": (5.73, 3.79)}
+        rho_paper = {k: a / b for k, (a, b) in paper.items()}
+        print({k: round(v, 4) for k, v in rho_paper.items()}, "| relative excess of CNN FRR:", {k: f"{(a - b) / b:.1%}" for k, (a, b) in paper.items()})
+        check("N1.2.3a", all(abs((a - b) / b - 0.51) < 0.01 for a, b in paper.values()), "the paper's CNN FRR is ~51% higher at both operating points (turn 3 states 51%)")
+        check("N1.2.3b", abs(229 / 250 - 0.916) < 5e-4 and abs(291564 / 271692 - 1.0731) < 5e-4, f"footprint ratio: paper CRNN/CNN = {229/250:.3f}, ours gru/wide = {291564/271692:.3f} (our recurrent model is the larger one)")
+        gru = SUMM.loc["gru"]
+        err = lambda a: 1.0 - a
+        rho = {
+            "wide/gru @best epoch": err(SUMM.loc["wide", "acc@best_epoch"]) / err(gru["acc@best_epoch"]),
+            "wide/gru @last epoch": err(SUMM.loc["wide", "last_epoch_acc"]) / err(gru["last_epoch_acc"]),
+            "timepool/gru @best epoch": err(SUMM.loc["timepool", "acc@best_epoch"]) / err(gru["acc@best_epoch"]),
+            "baseline(seed 17)/gru @last": err(LEG[17].val_accuracy.iloc[-1]) / err(gru["last_epoch_acc"]),
+        }
+        for k, v in rho.items():
+            print(f"error ratio {k:30s} = {v:6.3f}")
+        se = np.sqrt(0.9008 * (1 - 0.9008) / n_val)
+        z = (0.8790 - 0.9008) / np.sqrt(2) / se
+        print(f"validation-split binomial SE at acc 0.90, n={n_val}: {se:.4f}; unpaired z for the 0.0218 gap = {z:.2f}")
+        check("N1.2.3c", abs(rho["wide/gru @best epoch"] - 1.22) < 0.01, f"wide/gru error ratio at best epoch = {rho['wide/gru @best epoch']:.3f} (text: 1.22)")
+        check("N1.2.3d", abs(z) < 2.0, f"|z| = {abs(z):.2f} < 2: the 0.9008 vs 0.8790 best-epoch gap is not resolvable on {n_val} validation clips alone")
+        check("N1.2.3e", rho["timepool/gru @best epoch"] > rho["wide/gru @best epoch"] and rho["baseline(seed 17)/gru @last"] > rho["timepool/gru @best epoch"],
+              "ordering of error ratios matches 'how much time information the arm keeps': wide < timepool < baseline")
+        """),
+
+        code(r"""
+        # Figure 2.2: validation accuracy per epoch for the three instrumented arms and the three legacy baseline seeds.
+        fig, ax = plt.subplots(1, 2, figsize=(13, 4.4), gridspec_kw={"width_ratios": [1.6, 1]})
+        for a in ARCHS:
+            h = DATA[a]["res"]["history"]
+            ax[0].plot([e["epoch"] + 1 for e in h], [e["val_accuracy"] for e in h], color=ACOL[a], lw=1.8, label=f"{a} ({DATA[a]['res']['parameters']:,} params)")
+        for s, ls in zip((17, 18, 19), (":", "--", "-.")):
+            ax[0].plot(LEG[s].epoch, LEG[s].val_accuracy, color=ACOL["baseline"], ls=ls, lw=1.2, label=f"legacy baseline seed {s}")
+        ax[0].axhline(1 / 12, color="k", lw=0.8, ls=":"); ax[0].text(36, 1 / 12 + 0.01, "chance 1/12", ha="right", fontsize=8)
+        ax[0].set_xlabel("epoch"); ax[0].set_ylabel("validation accuracy (504 clips)"); ax[0].legend(fontsize=8, loc="center right"); ax[0].set_title("Validation accuracy across training")
+        rho_lab = list(rho); rho_val = [rho[k] for k in rho_lab]
+        ax[1].barh(range(len(rho_lab)), rho_val, color=[ACOL["wide"], ACOL["wide"], ACOL["timepool"], ACOL["baseline"]])
+        ax[1].axvline(rho_paper["5dB@1FA/h"], color="r", ls="--", lw=1.2); ax[1].text(rho_paper["5dB@1FA/h"] + 0.05, -0.45, "paper 1.51", color="r", fontsize=8)
+        ax[1].axvline(1, color="k", lw=0.8)
+        ax[1].set_yticks(range(len(rho_lab))); ax[1].set_yticklabels(rho_lab, fontsize=8); ax[1].set_xlabel("error ratio (conv arm / gru)"); ax[1].set_title("How much worse than gru?")
+        varied("N1.2.f2", rho_val, [e["val_accuracy"] for a in ARCHS for e in DATA[a]["res"]["history"]])
+        plt.tight_layout(); savefig(fig, "fig2_2_val_curves_and_error_ratios.png")
+        """),
+
+        md(r"""
+        ### How to read this chart
+
+        Left: validation accuracy by epoch, coloured by architecture; the three grey lines are the legacy
+        globally-pooled baseline at seeds 17, 18, 19, and the dotted horizontal line is chance, $1/12=0.083$. `gru`
+        (blue) climbs to about $0.90$ and stays inside a narrow band; `wide` (green) reaches similar heights but
+        swings between roughly $0.63$ and $0.88$ in the last ten epochs; `timepool` (orange) never leaves the range
+        $0.40$ to $0.56$; the grey baseline seeds finish at $0.373$, $0.591$, $0.343$, a spread of $0.25$ *within one
+        architecture*. Right: the error ratio $\rho$ of each convolutional arm relative to `gru`, with the paper's
+        $1.51$ as the red dashed line and $1$ (no difference) as the black line. The `wide/gru` bar is at or above $1$ at
+        both summaries but its size depends on the epoch you read off, because of the oscillation on the left.
+
+        What the picture supports: the ordering "arms that keep the time axis beat arms that pool it" is large and
+        stable. What it does not support: any claim that the recurrent head beats a *time-preserving* wide CNN by the
+        paper's margin, since that gap is comparable to the epoch-to-epoch swing of `wide` and to the seed spread of
+        the baseline. The paper's margin is between a CRNN and a CNN that *also* preserves time inside its filters;
+        our biggest gaps come from removing the time axis altogether.
         """),
     ]

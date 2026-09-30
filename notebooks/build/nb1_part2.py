@@ -1,975 +1,663 @@
-"""Notebook 1, Part 2: Selective classification and score function scale sensitivity.
+"""NB1 part 2: section 3 (where our data contradicts the attribution) and section 4 (neural collapse).
 
-Sections:
-- 3. Selective classification: selector, coverage, selection risk (source: Liang et al., TMLR 2024; L)
-- 4. Score functions and scale sensitivity (source: L Sec 3.1-3.2; derived here for the toy)
-- 4b. Selection under covariate shift and novel-class inputs (derived here)
-- Conclusion: what the paper does NOT settle
+Measured quantities come from arch-*.result.json (summary block) and arch-*.probes.npz. Constructed inputs in
+section 4 (a simplex ETF and a noise-scaled copy) are labelled unit-test fixtures for the NC formulas only.
 """
-
 from nbkit import md, code
 
 
 def cells():
     return [
-        # ─────────────────────────────────────────────────────────────────────────────────
-        # Section 3: Selective classification (source: Liang et al., TMLR 2024; L)
-        # ─────────────────────────────────────────────────────────────────────────────────
+        md(r"""
+        ## 3. Where our data contradicts the attribution
 
-        md("""
-        ## 3. Selective classification: selector, coverage, selection risk (source: Liang et al., TMLR 2024; L)
+        ### 3.1 What the paper says, stated so that it can be tested
 
-        Selective classification extends standard prediction by allowing a model to abstain (reject) on uncertain examples. The framework defines two components:
+        The CRNN paper (Arik et al., arXiv:1703.05390; turns 2 and 3) makes two separable statements.
 
-        **Paraphrase of Liang et al. Eq. (1); L p.3.** A selective classifier is a pair $(f, g)$ where $f$ is the **predictor** (e.g., argmax of softmax probabilities) and $g: \\mathcal{X} \\to \\{0,1\\}$ is the **selector** (abstention rule). On input $x$, the system predicts $f(x)$ if $g(x) = 1$ and abstains otherwise.
+        1. **A mechanism.** The advantage is attributed to complementary strengths: convolutions capture local
+           time-and-frequency structure, the bidirectional recurrent layers capture long-range temporal context,
+           and, in the paper's words as returned by the trace, *recurrent layers adapt better to individual noise
+           signatures*.
+        2. **A dose-response.** The CRNN's advantage **narrows as SNR increases**: at $5$ dB the CNN's false-reject
+           rate is about $51\%$ higher, and the CRNN's test accuracy at $0.5$ false alarms per hour rises from
+           $97.71\%$ at $5$ dB to $98.71\%$ at $10$ dB and $99.30\%$ at $20$ dB, i.e. cleaner audio leaves less room
+           for either model to differ.
 
-        The selector is induced by a **score function** $s: \\mathcal{X} \\to \\mathbb{R}$ and a threshold $\\gamma$:
+        Write $\Delta(s)=\mathrm{acc}_{\text{rec}}(s)-\mathrm{acc}_{\text{conv}}(s)$ for the recurrent model's accuracy
+        advantage in condition $s$. The two statements together predict
+        $$\Delta(\text{clean})\ \ge 0,\qquad \Delta(\text{noise})\ >\ \Delta(\text{clean}),\qquad \Delta(s)\ \text{decreasing in SNR}.$$
+        Our data can test the first two, but only coarsely: the exploration configuration has four conditions
+        (`clean`, `gain_+10`, `reverb_mid`, `noise_10`), of which only `noise_10` is an additive-noise condition and
+        there is exactly one SNR level. The third prediction (a dose-response curve) cannot be tested at all.
 
-        $$g_{s,\\gamma}(x) = \\mathbb{1}[s(x) > \\gamma] \\quad \\text{(Eq. 2; L p.3)}$$
+        ### 3.2 What we measured
 
-        The quality of selective classification is measured by two key metrics defined on the retained subset:
-
-        $$\\varphi = \\mathbb{E}[g(x)] \\quad \\text{(coverage: fraction of samples where } g(x)=1\\text{)}$$
-
-        $$R = \\frac{\\mathbb{E}[\\ell(f(x), y) \\cdot g(x)]}{\\varphi} \\quad \\text{(selection risk: mean 0/1 loss on retained samples; Eq. 3; L p.3)}$$
-
-        where $\\ell(f(x), y) = \\mathbb{1}[f(x) \\ne y]$ is the standard 0/1 classification loss.
-
-        Under a distribution shift, both $\\varphi$ and $R$ change. The paper formalizes this:
-
-        **Paraphrase of Liang et al. Eq. (8); L p.4.** Under a shifted distribution $D'$, coverage and selection risk are re-defined with expectations taken under $D'$; the paper states this generalization assumes no outliers.
-
-        $$\\varphi' = \\mathbb{E}_{D'}[g(x)], \\quad R' = \\frac{\\mathbb{E}_{D'}[\\ell(f(x), y) \\cdot g(x)]}{\\varphi'} \\quad \\text{(Eq. 8; L p.4)}$$
-
-        **What the risk-coverage trade-off reveals:** The risk-coverage (RC) curve plots coverage $\\varphi$ on the x-axis and selection risk $R$ on the y-axis as the threshold $\\gamma$ varies from $-\\infty$ (accept all) to $+\\infty$ (reject all). The curve depends **only on the ranking of scores**, not their absolute magnitude.
-
-        **Derivation:** Suppose we order examples by descending score: $s(x_1) \\ge s(x_2) \\ge \\cdots \\ge s(x_n)$. At coverage level $\\varphi = k/n$, we retain the top-$k$ examples and compute their error rate. If the score scale is multiplied by a constant $\\lambda > 0$, the ranking remains identical, so the RC curve is invariant to positive scaling.
-
-        ### The Area Under the Risk-Coverage Curve (AURC)
-
-        A single-number summary of selective classification performance is the area under the RC curve:
-
-        $$\\text{AURC} = \\int_0^1 R(\\varphi) \\, d\\varphi$$
-
-        where $R(\\varphi)$ is the selection risk at coverage $\\varphi$. Numerically, using the trapezoid rule:
-
-        $$\\text{AURC}_{\\text{trap}} = \\sum_{i=1}^{m-1} \\frac{1}{2} (R_i + R_{i+1}) (\\varphi_{i+1} - \\varphi_i)$$
-
-        **Normalized partial AURC-$\\alpha$:** To focus on a specific coverage regime $[0, \\alpha]$, we compute:
-
-        $$\\text{nAURC}_{\\alpha} = \\frac{1}{\\alpha} \\int_0^\\alpha R(\\varphi) \\, d\\varphi$$
-
-        This is the area-normalized average risk over the first $\\alpha$ fraction of samples (lower is better).
-
-        **Oracle lower bound (derived here):** Let the base classifier have error rate $e$. The oracle score ranks every correct prediction above every error. Then $R(\\varphi)=0$ for $\\varphi \\le 1-e$, and beyond that the retained set contains $(\\varphi-(1-e))n$ errors out of $\\varphi n$ samples, so $R(\\varphi) = 1 - (1-e)/\\varphi$. Integrating,
-
-        $$\\text{AURC}_{\\text{oracle}}(e) = \\int_{1-e}^{1}\\Bigl(1-\\frac{1-e}{\\varphi}\\Bigr)d\\varphi = e + (1-e)\\ln(1-e).$$
-
-        This is strictly positive for $0<e<1$: even a perfect ranker cannot reach AURC $=0$, because at coverage 1 the risk is the base error $e$. For $e=0.3$ it equals $0.3+0.7\\ln 0.7$, evaluated in the code below.
-
-        **Random-score reference:** If the score is independent of correctness, the expected RC curve is flat at the base error rate $e$, so the expected AURC is $e$ (a finite-$n$ curve fluctuates around this line, most at small coverage where few samples are retained).
+        Our architecture race was **clean-only**: every arm trained on clean audio and the stress conditions are
+        applied at test time only. In that regime the paper's second statement predicts a small `gru`-versus-`wide`
+        margin, and that is what we see (about $0.02$ in accuracy on the clean test split). So far the two agree.
+        The `noise_10` condition is where the mechanism should show, and it is where the data disagree: `gru` scores
+        $0.1380$, the *lowest* of the three arms, and `wide` scores $0.2519$, the *highest*. That is the reverse of
+        "recurrent layers adapt better to noise". The next cell loads the numbers for all four conditions with the
+        bootstrap intervals recorded in the result files.
         """),
 
-        code("""
-        # S3.1: Toy dataset generation and risk-coverage curve computation.
-        import numpy as np
-        from src.metrics import risk_coverage_curve, selective_risk, aurc, bootstrap_interval
-        import matplotlib.pyplot as plt
-
-        # Generate a simple 4-class dataset for selective classification.
-        s_n_toy3 = 100
-        s_n_classes3 = 4
-        s_rng3 = np.random.default_rng(RNG_SEED + 300)
-
-        # Generate predicted probabilities with varying confidence.
-        s_logits3 = s_rng3.standard_normal((s_n_toy3, s_n_classes3))
-        s_true_labels3 = s_rng3.integers(0, s_n_classes3, s_n_toy3)
-        # Boost correct class logit to simulate a working classifier.
-        s_logits3[np.arange(s_n_toy3), s_true_labels3] += 2.0
-        # Softmax to get probabilities.
-        s_max_logits3 = np.max(s_logits3, axis=1, keepdims=True)
-        s_exp_logits3 = np.exp(s_logits3 - s_max_logits3)
-        s_probs3 = s_exp_logits3 / np.sum(s_exp_logits3, axis=1, keepdims=True)
-
-        # Extract max-softmax confidence as score.
-        s_conf3 = np.max(s_probs3, axis=1)
-        # Compute correctness (0/1 loss).
-        s_pred3 = np.argmax(s_probs3, axis=1)
-        s_correct3 = (s_pred3 == s_true_labels3)
-
-        # Compute risk-coverage curve.
-        s_coverage3, s_risk3 = risk_coverage_curve(s_conf3, s_correct3)
-
-        check("S3.1", len(s_coverage3) == s_n_toy3 and s_coverage3[-1] == 1.0 and abs(s_risk3[-1] - np.mean(~s_correct3)) < 1e-12,
-              f"RC curve has {len(s_coverage3)} points (one per row); risk at coverage 1 is {s_risk3[-1]:.4f} = base error {np.mean(~s_correct3):.4f}")
-
-        print(f"Risk-Coverage Curve (n={s_n_toy3}, K={s_n_classes3}):")
-        print(f"  Coverage range: [{s_coverage3[0]:.3f}, {s_coverage3[-1]:.3f}]")
-        print(f"  Risk range: [{s_risk3[0]:.3f}, {s_risk3[-1]:.3f}]")
+        code(r"""
+        # N1.3.1: accuracy by arm x condition (uncalibrated, test split n=1080) with the recorded bootstrap CIs.
+        CONDS = ["clean", "gain_+10", "reverb_mid", "noise_10"]
+        def S(a, c, kind="uncalibrated"):
+            return DATA[a]["res"]["summary"]["conditions"][c][kind]
+        N_TEST = DATA["gru"]["res"]["summary"]["n_test"]
+        ACC = pd.DataFrame({a: {c: S(a, c)["accuracy"] for c in CONDS} for a in ARCHS})
+        LO = pd.DataFrame({a: {c: S(a, c)["ci"]["accuracy"]["lower"] for c in CONDS} for a in ARCHS})
+        HI = pd.DataFrame({a: {c: S(a, c)["ci"]["accuracy"]["upper"] for c in CONDS} for a in ARCHS})
+        display(ACC.round(4))
+        check("N1.3.1a", all(DATA[a]["res"]["summary"]["n_test"] == 1080 for a in ARCHS) and sorted(DATA["gru"]["res"]["summary"]["conditions"]) == sorted(CONDS),
+              f"every arm evaluated on n_test={N_TEST} with the same four conditions {CONDS}")
+        check("N1.3.1b", [round(ACC.loc["noise_10", a], 4) for a in ("gru", "timepool", "wide")] == [0.1380, 0.1472, 0.2519],
+              "noise_10 accuracy: gru 0.1380, timepool 0.1472, wide 0.2519")
+        check("N1.3.1c", ACC.loc["noise_10"].idxmin() == "gru" and ACC.loc["noise_10"].idxmax() == "wide", "under noise_10 gru is the worst arm and wide the best")
+        check("N1.3.1d", all(LO.loc[c, a] <= ACC.loc[c, a] <= HI.loc[c, a] for a in ARCHS for c in CONDS), "every point estimate lies inside its recorded bootstrap interval")
+        CHANCE = 1 / 12
+        _mult = ", ".join("%s %.2fx" % (a, ACC.loc["noise_10", a] / CHANCE) for a in ARCHS)
+        note("N1.3.1e", f"chance is 1/12 = {CHANCE:.4f}; noise_10 accuracies are {_mult} chance: all three arms are near the floor")
+        LN12 = np.log(12)
+        nll10 = {a: S(a, "noise_10")["nll"] for a in ARCHS}
+        print("noise_10 NLL (uncalibrated):", {a: round(v, 3) for a, v in nll10.items()}, "| uniform predictor NLL = ln 12 =", round(LN12, 4))
+        check("N1.3.1f", all(v > LN12 for v in nll10.values()), "under noise_10 every arm has NLL above ln 12: worse than answering with the uniform distribution")
         """),
 
-        code("""
-        # S3.2: Worked numeric example - hand-computed AURC on 8 points (no randomness, n=8).
-        from fractions import Fraction
-        s_scores_tiny = np.array([0.95, 0.90, 0.75, 0.65, 0.55, 0.50, 0.40, 0.25])
-        s_errors_tiny = np.array([False, False, True, False, True, True, False, True])  # True = the prediction is wrong.
-        s_correct_tiny = ~s_errors_tiny  # risk_coverage_curve expects `correct`, not `errors`.
+        md(r"""
+        ### 3.3 How big is the contradiction, and of what kind?
 
-        s_cov_tiny, s_risk_tiny = risk_coverage_curve(s_scores_tiny, s_correct_tiny)
-        s_aurc_tiny = aurc(s_cov_tiny, s_risk_tiny)
+        Two different sources of uncertainty must not be confused. The first is **test-set sampling**: with $n=1080$
+        test clips and accuracy $\hat p$, the binomial standard error is $\sqrt{\hat p(1-\hat p)/n}$, and the
+        difference of two independent arms has variance $\sigma_\Delta^2=\sigma_1^2+\sigma_2^2$. The second is
+        **training-run variance** (seed, data order, initialisation), which a single trained model per arm cannot
+        estimate at all. The first is small and computable; the second is unknown and, for this project, potentially
+        large: the legacy baseline's three seeds ended at $0.3730$, $0.5913$ and $0.3433$ within one architecture.
 
-        # Independent hand computation with exact fractions: scores are already sorted descending.
-        s_cum_err = np.cumsum(s_errors_tiny.astype(int))
-        s_hand_risk = [Fraction(int(s_cum_err[k]), k + 1) for k in range(8)]
-        s_hand_aurc = sum((s_hand_risk[k] + s_hand_risk[k + 1]) / 2 * Fraction(1, 8) for k in range(7))
-        s_base_error_tiny = float(np.mean(s_errors_tiny))  # 4/8
-
-        check("S3.2a", abs(s_aurc_tiny - float(s_hand_aurc)) < 1e-12,
-              f"aurc()={s_aurc_tiny:.6f} vs exact-fraction hand value {float(s_hand_aurc):.6f} = {s_hand_aurc}")
-        check("S3.2b", 0.0 < s_aurc_tiny < s_base_error_tiny,
-              f"AURC {s_aurc_tiny:.4f} lies strictly below base error {s_base_error_tiny:.4f} because the score ranks errors low")
-        check("S3.2c", np.allclose(s_risk_tiny, [float(r) for r in s_hand_risk], atol=1e-12) and s_risk_tiny[-1] == s_base_error_tiny,
-              f"risk at full coverage {s_risk_tiny[-1]:.4f} equals base error {s_base_error_tiny:.4f}")
-
-        print("Tiny example (n=8, 4 errors):")
-        print(f"  Coverage: {[f'{c:.3f}' for c in s_cov_tiny]}")
-        print(f"  Risk:     {[f'{r:.3f}' for r in s_risk_tiny]}")
-        print(f"  AURC (trapezoid) = {s_aurc_tiny:.4f}; hand value = {s_hand_aurc} = {float(s_hand_aurc):.4f}")
+        The cell below computes $\Delta=\mathrm{acc}_{\text{gru}}-\mathrm{acc}_{\text{wide}}$ per condition with the
+        first kind of uncertainty only, and tests the paper's directional prediction against it. The comparison is
+        unpaired because per-clip predictions are not stored, so the standard error is conservative in exactly the
+        way that pairing would reduce it; that does not change the qualitative reading.
         """),
 
-        code("""
-        # S3.3: Verify that RC curve depends only on ranking, not scale.
-        # Scale the confidence scores and check RC curve invariance.
-        s_conf_scaled1 = s_conf3.copy()
-        s_conf_scaled2 = s_conf3 * 2.0
-        s_conf_scaled3 = s_conf3 * 0.1
-
-        s_cov1, s_risk1 = risk_coverage_curve(s_conf_scaled1, s_correct3)
-        s_cov2, s_risk2 = risk_coverage_curve(s_conf_scaled2, s_correct3)
-        s_cov3, s_risk3_scaled = risk_coverage_curve(s_conf_scaled3, s_correct3)
-
-        # Check that curves are identical (coverage and risk should not change).
-        s_max_dev3 = max(float(np.max(np.abs(s_risk1 - s_risk2))), float(np.max(np.abs(s_risk1 - s_risk3_scaled))))
-        check("S3.3", s_max_dev3 < 1e-12,
-              f"RC curve scale-invariant: max |risk diff| across scales x1, x2, x0.1 = {s_max_dev3:.1e} (< 1e-12)")
-
-        s_aurc1 = aurc(s_cov1, s_risk1)
-        s_aurc2 = aurc(s_cov2, s_risk2)
-        s_aurc3 = aurc(s_cov3, s_risk3_scaled)
-        print(f"AURC invariance test:")
-        print(f"  AURC (original):       {s_aurc1:.4f}")
-        print(f"  AURC (scale × 2):      {s_aurc2:.4f}")
-        print(f"  AURC (scale × 0.1):    {s_aurc3:.4f}")
+        code(r"""
+        # N1.3.2: Delta(condition) = acc_gru - acc_wide with test-sampling SE only (unpaired binomial).
+        def se_bin(p, n=N_TEST):
+            return np.sqrt(p * (1 - p) / n)
+        rows = []
+        for c in CONDS:
+            pg, pw = ACC.loc[c, "gru"], ACC.loc[c, "wide"]
+            d = pg - pw; se = np.hypot(se_bin(pg), se_bin(pw))
+            rows.append({"condition": c, "acc_gru": pg, "acc_wide": pw, "Delta": d, "SE(test sampling)": se, "z": d / se,
+                         "95% lo": d - 1.96 * se, "95% hi": d + 1.96 * se})
+        DELTA = pd.DataFrame(rows).set_index("condition")
+        display(DELTA.round(4))
+        d_clean, d_noise = DELTA.loc["clean", "Delta"], DELTA.loc["noise_10", "Delta"]
+        check("N1.3.2a", abs(d_clean - 0.0222) < 5e-4, f"Delta(clean) = {d_clean:+.4f}: gru slightly ahead on the clean test split")
+        check("N1.3.2b", DELTA.loc["clean", "95% lo"] < 0.0 < DELTA.loc["clean", "95% hi"] or DELTA.loc["clean", "z"] > 1.96,
+              f"Delta(clean) z = {DELTA.loc['clean', 'z']:+.2f}: small margin, consistent with the paper's 'gap narrows in clean audio' (not a strong test)")
+        check("N1.3.2c", DELTA.loc["noise_10", "z"] < -1.96, f"Delta(noise_10) = {d_noise:+.4f}, z = {DELTA.loc['noise_10', 'z']:+.2f}: wide is ahead by more than test-set sampling can produce")
+        note("N1.3.2d", f"paper predicts Delta(noise) > Delta(clean); measured Delta(noise) - Delta(clean) = {d_noise - d_clean:+.4f}: the predicted direction is reversed")
+        note("N1.3.2e", "test-set sampling is the ONLY uncertainty in the SEs above; seed-to-seed training variance is unmeasured (one run per arm)")
         """),
 
-        code("""
-        # S3.4: Monte Carlo - random score vs oracle score against closed forms (n=2000, reps=100, seed RNG_SEED+304).
-        s_n_monte3 = 2000
-        s_n_reps3 = 100
-        s_p_err3 = 0.3  # true base error of the binary toy classifier
-        s_rng_monte3 = np.random.default_rng(RNG_SEED + 304)
-
-        s_aurc_random_scores, s_aurc_oracle_scores, s_oracle_closed_hat = [], [], []
-        for s_rep in range(s_n_reps3):
-            s_correct_mc = s_rng_monte3.uniform(0, 1, s_n_monte3) >= s_p_err3  # correct w.p. 0.7
-            s_e_hat = float(np.mean(~s_correct_mc))
-            s_scores_random = s_rng_monte3.uniform(0, 1, s_n_monte3)
-            s_aurc_random_scores.append(aurc(*risk_coverage_curve(s_scores_random, s_correct_mc)))
-            s_scores_oracle = s_correct_mc.astype(float)  # correct rows rank first
-            s_aurc_oracle_scores.append(aurc(*risk_coverage_curve(s_scores_oracle, s_correct_mc)))
-            s_oracle_closed_hat.append(s_e_hat + (1 - s_e_hat) * np.log(1 - s_e_hat))
-
-        s_aurc_random_arr = np.array(s_aurc_random_scores)
-        s_aurc_oracle_arr = np.array(s_aurc_oracle_scores)
-        s_oracle_closed = s_p_err3 + (1 - s_p_err3) * np.log(1 - s_p_err3)  # e + (1-e) ln(1-e)
-        s_random_mean, s_oracle_mean = s_aurc_random_arr.mean(), s_aurc_oracle_arr.mean()
-        s_random_se = s_aurc_random_arr.std(ddof=1) / np.sqrt(s_n_reps3)
-        s_oracle_se = s_aurc_oracle_arr.std(ddof=1) / np.sqrt(s_n_reps3)
-        # Per-replicate comparison to the closed form evaluated at that replicate's realised error rate.
-        s_oracle_gap = s_aurc_oracle_arr - np.array(s_oracle_closed_hat)
-
-        check("S3.4a", abs(s_random_mean - s_p_err3) <= 3 * s_random_se,
-              f"random-score AURC mean {s_random_mean:.4f} vs base error {s_p_err3} (|diff|={abs(s_random_mean - s_p_err3):.4f} <= 3 SE = {3 * s_random_se:.4f})")
-        check("S3.4b", abs(s_oracle_mean - s_oracle_closed) <= 3 * s_oracle_se,
-              f"oracle AURC mean {s_oracle_mean:.4f} vs closed form e+(1-e)ln(1-e) = {s_oracle_closed:.4f} (|diff|={abs(s_oracle_mean - s_oracle_closed):.4f} <= 3 SE = {3 * s_oracle_se:.4f})")
-        check("S3.4c", s_oracle_closed > 0.03 and s_oracle_mean > 0.03,
-              f"oracle AURC is strictly positive (closed form {s_oracle_closed:.4f}, measured {s_oracle_mean:.4f}); the value 0 is not attained")
-        check("S3.4d", np.max(np.abs(s_oracle_gap)) < 1e-6,
-              f"per-replicate trapezoid vs closed form at realised error: max |gap|={np.max(np.abs(s_oracle_gap)):.2e} (< 1e-6; discretisation error at n={s_n_monte3})")
-
-        print(f"Monte Carlo (n={s_n_monte3}, reps={s_n_reps3}, base error {s_p_err3}):")
-        print(f"  Random score AURC: mean={s_random_mean:.4f}, std={np.std(s_aurc_random_arr, ddof=1):.4f}, SE={s_random_se:.4f}")
-        print(f"  Oracle score AURC: mean={s_oracle_mean:.4f}, std={np.std(s_aurc_oracle_arr, ddof=1):.4f}, SE={s_oracle_se:.4f}; closed form={s_oracle_closed:.4f}")
+        code(r"""
+        # Figure 3.1: accuracy by condition and arm with recorded bootstrap CIs; chance line.
+        fig, ax = plt.subplots(figsize=(10.5, 4.6))
+        w = 0.26
+        for k, a in enumerate(ARCHS):
+            xs = np.arange(len(CONDS)) + (k - 1) * w
+            yv = ACC[a].values; lo = yv - LO[a].values; hi = HI[a].values - yv
+            ax.bar(xs, yv, width=w, color=ACOL[a], label=a, yerr=[lo, hi], capsize=3)
+            for x_, v_ in zip(xs, yv):
+                ax.text(x_, v_ + 0.03, f"{v_:.3f}", ha="center", fontsize=7.5, rotation=90)
+        ax.axhline(CHANCE, color="k", ls=":", lw=1); ax.text(3.45, CHANCE + 0.012, "chance 1/12", ha="right", fontsize=8)
+        ax.set_xticks(range(len(CONDS))); ax.set_xticklabels(CONDS); ax.set_ylabel("accuracy on test split (n=1080), uncalibrated")
+        ax.set_ylim(0, 1.08); ax.legend(ncol=3, loc="upper right")
+        ax.set_title("Accuracy per stress condition: gru leads on clean/reverb, trails on noise_10 (single run per arm)")
+        varied("N1.3.f1", ACC.values)
+        savefig(fig, "fig3_1_accuracy_by_condition.png")
         """),
 
-        code("""
-        # S3.5: The trapezoid rule used by src.metrics.aurc versus a manual sum and versus a plain mean of risks.
-        s_aurc_trap = aurc(s_cov_tiny, s_risk_tiny)
-        s_manual = sum(0.5 * (s_risk_tiny[k] + s_risk_tiny[k + 1]) * (s_cov_tiny[k + 1] - s_cov_tiny[k]) for k in range(len(s_cov_tiny) - 1))
-        s_aurc_discrete_avg = float(np.mean(s_risk_tiny))
-        # A plain mean over all 8 points weights the first point 1/8 and includes the left edge; the trapezoid starts at coverage 1/8.
-        s_expected_gap = abs(s_aurc_trap - s_aurc_discrete_avg)
-
-        print("Tiny example AURC comparison:")
-        print(f"  Trapezoid rule (src.metrics.aurc): {s_aurc_trap:.4f}")
-        print(f"  Manual trapezoid sum:              {s_manual:.4f}")
-        print(f"  Plain mean of the 8 risks:         {s_aurc_discrete_avg:.4f}   (gap {s_expected_gap:.4f})")
-        check("S3.5", abs(s_aurc_trap - s_manual) < 1e-12 and s_expected_gap > 1e-3,
-              f"aurc() equals the manual trapezoid sum to 1e-12, and differs from the plain mean by {s_expected_gap:.4f}")
-        """),
-
-        # ─────────────────────────────────────────────────────────────────────────────────
-        # Plot 1: Risk-coverage curves and AURC
-        # ─────────────────────────────────────────────────────────────────────────────────
-
-        code("""
-        # S3.6: Plot risk-coverage curves for random, imperfect, and oracle scores (n=200, seed RNG_SEED+306).
-        s_rng_plot3 = np.random.default_rng(RNG_SEED + 306)
-        s_n_plot3 = 200
-        s_labels_plot3 = s_rng_plot3.integers(0, 2, s_n_plot3)
-        s_preds_plot3 = np.where(s_rng_plot3.uniform(0, 1, s_n_plot3) < 0.75, s_labels_plot3, 1 - s_labels_plot3)
-        s_correct_plot3 = (s_preds_plot3 == s_labels_plot3)
-        s_error_rate_plot3 = float(np.mean(~s_correct_plot3))
-
-        # Three score functions:
-        s_scores_rand_plot = s_rng_plot3.uniform(0, 1, s_n_plot3)  # Random.
-        s_scores_real_plot = 0.3 * s_correct_plot3.astype(float) + 0.25 * s_rng_plot3.standard_normal(s_n_plot3)  # Imperfect score: weak correctness signal plus noise.
-        s_scores_oracle_plot = s_correct_plot3.astype(float)  # Oracle.
-
-        s_cov_rand, s_risk_rand = risk_coverage_curve(s_scores_rand_plot, s_correct_plot3)
-        s_cov_real, s_risk_real = risk_coverage_curve(s_scores_real_plot, s_correct_plot3)
-        s_cov_oracle, s_risk_oracle = risk_coverage_curve(s_scores_oracle_plot, s_correct_plot3)
-
-        s_aurc_rand_plot = aurc(s_cov_rand, s_risk_rand)
-        s_aurc_real_plot = aurc(s_cov_real, s_risk_real)
-        s_aurc_oracle_plot = aurc(s_cov_oracle, s_risk_oracle)
-
-        plt.figure(figsize=(8, 5.5))
-        plt.plot(s_cov_rand, s_risk_rand, label=f"Random score (AURC={s_aurc_rand_plot:.4f})", color=PALETTE["reference"], linewidth=2, linestyle="--")
-        plt.plot(s_cov_real, s_risk_real, label=f"Imperfect score (AURC={s_aurc_real_plot:.4f})", color=PALETTE["clean"], linewidth=2.5)
-        plt.plot(s_cov_oracle, s_risk_oracle, label=f"Oracle score (AURC={s_aurc_oracle_plot:.4f})", color=PALETTE["frozen"], linewidth=2, linestyle=":")
-        # Baseline: flat line at error rate.
-        plt.axhline(s_error_rate_plot3, color=PALETTE["band"], linewidth=1.5, linestyle="-.", alpha=0.7, label=f"Base error rate={s_error_rate_plot3:.3f}")
-        plt.xlabel("Coverage φ", fontsize=12)
-        plt.ylabel("Selection Risk R", fontsize=12)
-        plt.title("Risk-Coverage Curves: Effect of Score Quality", fontsize=13, fontweight="bold")
-        plt.legend(fontsize=10, loc="best")
-        plt.xlim(0, 1)
-        plt.ylim(0, max(s_risk_rand) * 1.05)
-        plt.tight_layout()
-        plt.show()
-
-        check("S3.6", s_aurc_oracle_plot < s_aurc_real_plot < s_aurc_rand_plot,
-              f"oracle {s_aurc_oracle_plot:.4f} < imperfect {s_aurc_real_plot:.4f} < random {s_aurc_rand_plot:.4f} (n={s_n_plot3}, base error {s_error_rate_plot3:.3f})")
-        """),
-
-        md("""
+        md(r"""
         ### How to read this chart
 
-        The risk-coverage curve plots selection risk on the y-axis against coverage (fraction of samples retained) on the x-axis. Each curve shows what happens as we vary the threshold $\\gamma$ to accept or reject examples:
-
-        - **x-axis (Coverage):** Moves from left (reject most, keep only the most confident) to right (accept all). Coverage $\\varphi = 0$ means reject all; $\\varphi = 1$ means accept all.
-        - **y-axis (Selection Risk):** The error rate among retained samples. Lower is better.
-        - **Oracle score (dotted line):** Sits at risk 0 until coverage reaches one minus the base error, then climbs toward the base error at coverage 1, following $1-(1-e)/\\varphi$. It is an unattainable lower bound, and its AURC is positive, not zero.
-        - **Imperfect score (solid line):** Lies above the oracle and below the random curve; risk falls as coverage decreases because low-score rows are rejected, but it does not reach zero because the score is noisy.
-        - **Random score (dashed line):** Fluctuates around the base error rate (most at small coverage where few rows are retained) because random scores carry no ranking information.
-        - **Base error rate (dash-dot line):** The classifier's overall error rate if we predict on all samples (coverage = 1).
-
-        **Takeaway:** AURC is the average selection risk over coverage levels, so a smaller area means the score keeps errors out of the retained set more effectively. A good score bends the curve downward as coverage shrinks; a useless score stays flat near the base error. The area between the imperfect and random curves quantifies the score's utility, and the area between the imperfect and oracle curves is the headroom that remains.
+        Each group of three bars is one test condition; bar height is test accuracy, whiskers are the bootstrap
+        interval recorded in the result files (exploration configuration: $200$ resamples, so the whiskers are
+        coarse), the dotted line is chance at $1/12$. Read across a group to compare architectures under the *same*
+        condition. On `clean` and `reverb_mid` the blue `gru` bar is at or above the green `wide` bar; on `gain_+10`
+        they are level; on `noise_10` the ordering flips, and all three bars collapse to a height that is only
+        $1.7$ to $3.0$ times chance. The point of the chart is the **flip**, not the absolute heights: a mechanism
+        of the form "recurrent layers adapt to noise" predicts that the blue bar rises relative to the green bar
+        when moving from `clean` to `noise_10`, and it falls. What would make this reading wrong: intervals that
+        overlap heavily in the `noise_10` group (they do not; the whiskers for `gru` and `wide` there are separated by
+        several bootstrap half-widths) or a second seed that reversed the order (unknown).
         """),
 
-        code("""
-        # S3.7: Normalized partial AURC-alpha at multiple coverage levels.
-        # Compute AURC only over the first alpha fraction of samples.
-        s_alphas = np.array([0.25, 0.5, 0.75, 1.0])
-        s_n_alphas = len(s_alphas)
-        s_naurcs_rand = []
-        s_naurcs_real = []
-
-        for s_alpha in s_alphas:
-            # Find the index where coverage reaches alpha.
-            s_idx_alpha_rand = np.searchsorted(s_cov_rand, s_alpha, side="right")
-            s_idx_alpha_real = np.searchsorted(s_cov_real, s_alpha, side="right")
-
-            if s_idx_alpha_rand > 0:
-                s_cov_alpha_rand = s_cov_rand[:s_idx_alpha_rand]
-                s_risk_alpha_rand = s_risk_rand[:s_idx_alpha_rand]
-                # Ensure endpoint is exactly at alpha.
-                if s_cov_alpha_rand[-1] < s_alpha:
-                    s_cov_alpha_rand = np.append(s_cov_alpha_rand, s_alpha)
-                    s_idx_linear = np.interp(s_alpha, s_cov_rand, np.arange(len(s_cov_rand)))
-                    s_risk_interp = np.interp(s_alpha, s_cov_rand, s_risk_rand)
-                    s_risk_alpha_rand = np.append(s_risk_alpha_rand, s_risk_interp)
-                s_partial_aurc_rand = aurc(s_cov_alpha_rand, s_risk_alpha_rand)
-                s_naurcs_rand.append(s_partial_aurc_rand / s_alpha)
-            else:
-                s_naurcs_rand.append(np.nan)
-
-            if s_idx_alpha_real > 0:
-                s_cov_alpha_real = s_cov_real[:s_idx_alpha_real]
-                s_risk_alpha_real = s_risk_real[:s_idx_alpha_real]
-                if s_cov_alpha_real[-1] < s_alpha:
-                    s_cov_alpha_real = np.append(s_cov_alpha_real, s_alpha)
-                    s_risk_interp = np.interp(s_alpha, s_cov_real, s_risk_real)
-                    s_risk_alpha_real = np.append(s_risk_alpha_real, s_risk_interp)
-                s_partial_aurc_real = aurc(s_cov_alpha_real, s_risk_alpha_real)
-                s_naurcs_real.append(s_partial_aurc_real / s_alpha)
-            else:
-                s_naurcs_real.append(np.nan)
-
-        print(f"Normalized partial AURC-alpha:")
-        print(f"  Alpha    | nAURC (random) | nAURC (real)")
-        for s_a, s_nr, s_nreal in zip(s_alphas, s_naurcs_rand, s_naurcs_real):
-            print(f"  {s_a:.2f}    | {s_nr:14.4f} | {s_nreal:.4f}")
-
-        check("S3.7", all(~np.isnan(s_naurcs_real)) and all(s_naurcs_real[i] <= s_naurcs_rand[i] for i in range(len(s_alphas))),
-              f"nAURC-alpha computed for {len(s_alphas)} levels; real <= random everywhere")
+        code(r"""
+        # Figure 3.2: Delta = acc_gru - acc_wide per condition, with test-sampling-only 95% intervals, against the paper's predicted sign.
+        fig, ax = plt.subplots(figsize=(8.6, 4.4))
+        xs = np.arange(len(CONDS))
+        ax.errorbar(xs, DELTA["Delta"], yerr=1.96 * DELTA["SE(test sampling)"], fmt="o", color=ACOL["gru"], capsize=5, ms=8, label="measured Delta (95%, test-set sampling only)")
+        ax.axhline(0, color="k", lw=0.9)
+        ax.fill_between([-0.4, 3.4], 0, 0.3, color=PALETTE["band"], alpha=0.25, label="paper's predicted region under noise (Delta > 0)")
+        for x_, v_ in zip(xs, DELTA["Delta"]):
+            ax.text(x_ + 0.08, v_ + 0.012, f"{v_:+.3f}", fontsize=9)
+        ax.set_xticks(xs); ax.set_xticklabels(CONDS); ax.set_xlim(-0.4, 3.4); ax.set_ylim(-0.2, 0.15)
+        ax.set_ylabel("acc(gru) - acc(wide)"); ax.legend(loc="lower left", fontsize=8)
+        ax.set_title("The recurrent advantage under each condition")
+        varied("N1.3.f2", DELTA["Delta"].values)
+        savefig(fig, "fig3_2_gru_minus_wide.png")
         """),
 
-        # ─────────────────────────────────────────────────────────────────────────────────
-        # Section 4: Score functions and scale sensitivity (source: L Sec 3.1-3.2, derived here)
-        # ─────────────────────────────────────────────────────────────────────────────────
+        md(r"""
+        ### How to read this chart
 
-        md("""
-        ## 4. Score functions and scale sensitivity (source: L Sec 3.1-3.2; derived here for the toy)
+        Each dot is $\Delta=\mathrm{acc}_{\text{gru}}-\mathrm{acc}_{\text{wide}}$ for one condition; the vertical bar is
+        a $95\%$ interval that includes **only** test-set sampling noise, so it is a floor on the true uncertainty, not
+        a full interval. The shaded band is where the paper's mechanism would put the `noise_10` point (positive, and
+        larger than on `clean`). The `clean` dot is slightly positive with an interval that reaches zero; the `noise_10`
+        dot sits far below zero, outside the band, by roughly seven of its own standard errors. If the dot were a
+        random fluctuation of the test set alone it would not be there; that leaves training-run variance (unknown),
+        a genuine architectural effect, or an interaction with the specific perturbation as candidate explanations,
+        and this notebook cannot separate them.
 
-        Selective classification ranks examples by a score $s(x)$. The paper distinguishes two families: **softmax-response (SR) scores**, computed from the softmax output and therefore sensitive to the overall scale of the logits, and **margin scores**, computed directly from the logits (or from distances to the decision hyperplanes) and therefore insensitive to it.
+        ### 3.4 What this does and does not establish
 
-        ### Softmax-response scores (Eq. 7; L p.4)
+        **What is established.** In this run, with these weights, `gru` is not more robust to `noise_10` than the
+        time-preserving `wide` CNN; it is less robust, by more than test-set sampling explains, and its probabilities
+        are the worst-behaved (NLL $4.467$ against $4.071$ for `wide`, with ECE at $0.747$: confidently wrong).
 
-        With $p = \\text{softmax}(z)$ for logits $z \\in \\mathbb{R}^K$, the paper defines three SR scores named $\\text{SR}_{\\max}$, $\\text{SR}_{\\text{doctor}}$ and $\\text{SR}_{\\text{ent}}$. The forms used in this notebook are
+        **What is not established.** Whether this is a property of the architectures or of this training run. One
+        seed cannot settle it, and the exploration configuration has exactly one additive-noise condition. The paper's
+        statement is about noise signatures the model was *exposed to*, and the grounding does not say whether the
+        paper's noisy conditions were seen at training time; ours were not. So we report a tension, not a refutation.
 
-        $$s_{\\max}(x) = \\max_k p_k, \\qquad s_{\\text{doctor}}(x) = 1 - \\frac{1}{\\sum_k p_k^2}, \\qquad s_{\\text{ent}}(x) = \\sum_k p_k \\log p_k = -H(p).$$
-
-        **Provenance.** These are the three softmax-response scores of Eq. (7) as printed in the paper (L p.4): max-softmax, the DOCTOR score $1 - 1/\\lVert p\\rVert_2^2$, and the negative entropy $\\sum_k p_k \\log p_k$; each is oriented so that a larger value means more confident. The DOCTOR score is a strictly increasing function of $\\sum_k p_k^2$, so ranking by that explicitly named order key gives the same ordering (and risk-coverage curve) as ranking by the displayed DOCTOR score. A risk-coverage curve depends only on the ordering of the scores, so any strictly increasing transform of these forms gives the same curve. The top-two probability gap $p_{(1)} - p_{(2)}$ is a different score and is not used here.
-
-        Multiplying the logits by a scale $\\lambda > 0$ changes the softmax output:
-
-        $$\\text{softmax}(\\lambda z) \\to \\text{uniform} \\ \\text{ as } \\lambda \\to 0, \\qquad \\text{softmax}(\\lambda z) \\to \\text{one-hot at } \\arg\\max_k z_k \\ \\text{ as } \\lambda \\to \\infty .$$
-
-        Every SR score is a function of $p$, so its values and its **ordering** of examples can change with $\\lambda$.
-
-        ### Margin scores (Eqs. 11-13; L p.8)
-
-        The confidence margin is defined on the logits, and the geometric margin on signed distances $d_j = (w_j \\cdot \\phi(x) + b_j)/\\lVert w_j \\rVert$ to the class hyperplanes:
-
-        $$s_{\\text{conf-M}}(x) = z_{(1)} - z_{(2)}, \\qquad s_{\\text{geo-M}}(x) = d_{(1)} - d_{(2)} .$$
-
-        Only the confidence margin is implemented below. Scaling gives $s_{\\text{conf-M}}(\\lambda z) = \\lambda\\, s_{\\text{conf-M}}(z)$, a positive multiple, so the ordering of examples, and hence the whole RC curve, is unchanged.
-
-        ### Lemma 3.1 (paraphrase; L pp.6-7)
-
-        **Paraphrase of Liang et al. Lemma 3.1; L pp.6-7.** As the logit scale $\\lambda$ grows without bound, the ordering induced by each of the three SR scores approaches the ordering induced by the confidence margin $z_{(1)} - z_{(2)}$.
-
-        ### What we derive and test here (derived here)
-
-        Write $d_k = z_{(1)} - z_{(k)} \\ge 0$ for $k = 2, \\dots, K$ (so $d_2$ is the confidence margin) and $S_\\lambda = \\sum_{k \\ge 2} e^{-\\lambda d_k}$. Then $p_{(1)} = 1/(1+S_\\lambda)$ and $p_{(k)} = e^{-\\lambda d_k}/(1+S_\\lambda)$. In floating point $p_{(1)}$ rounds to exactly 1 once $S_\\lambda < 10^{-16}$, so the displayed $s_{\\max}=p_{(1)}$ rounds to 1 and creates ties. We therefore keep $\\log(1-s_{\\max})$ as a log-domain complement, used only to recover the actual score or preserve its ranking. For entropy the log-domain quantity is likewise a log-complement; for DOCTOR we use the explicitly named $\\text{doctor\\_order\\_key}=-\\log\\sum_k p_k^2$. This key decreases strictly as the displayed DOCTOR score $s_{\\text{doctor}}=1-1/\\sum_k p_k^2$ increases, so its negation gives the same descending ranking, including at high logit scales.
-
-        $$1 - s_{\\max} = \\frac{S_\\lambda}{1+S_\\lambda}, \\qquad \\sum_k p_k^2 = \\frac{1+Q_\\lambda}{(1+S_\\lambda)^2}, \\qquad H = \\log(1+S_\\lambda) + \\frac{\\lambda \\sum_{k\\ge2} d_k e^{-\\lambda d_k}}{1+S_\\lambda}.$$
-
-        Here $Q_\\lambda = \\sum_{k\\ge2} e^{-2\\lambda d_k}$, and therefore $\\text{doctor\\_order\\_key}=2\\log(1+S_\\lambda)-\\log(1+Q_\\lambda)$. Since $s_{\\text{doctor}}=1-\\exp(\\text{doctor\\_order\\_key})$, decreasing the key strictly increases the actual score. For entropy, $-\\sum_k p_k \\log p_k = \\sum_k p_k(\\lambda d_k + \\log(1+S_\\lambda))$ with $d_1 = 0$. The log-domain keys avoid rounding ties while preserving the displayed-score ranking.
-
-        **A bound for $s_{\\max}$.** Since $S_\\lambda = e^{-\\lambda d_2}\\bigl(1 + \\sum_{k\\ge3} e^{-\\lambda(d_k - d_2)}\\bigr)$ and $d_k \\ge d_2$ for $k \\ge 3$, the log-complement satisfies
-
-        $$\\lambda d_2 - \\log(K-1) \\;\\le\\; -\\log S_\\lambda \\;\\le\\; \\lambda d_2 .$$
-
-        Hence if two examples have margins with $\\lambda\\,(d_2(x) - d_2(x')) > \\log(K-1)$, then $x$ outranks $x'$ under $s_{\\max}$ too. Rank disagreement with the margin can therefore only occur among pairs whose margins differ by less than $\\log(K-1)/\\lambda$: for $K = 4$ and $\\lambda = 100$ that window is $\\log 3 / 100 \\approx 0.011$ in margin units. This is a worked example of why the ordering must converge. It is proved here only for $s_{\\max}$; for $s_{\\text{doctor}}$ and $s_{\\text{ent}}$ the leading term is also a monotone function of $\\lambda d_2$, but this study checks that numerically rather than proving it.
-
-        **What would make the toy conclusion wrong:** the checks below would fail if the log-domain score keys disagreed with their displayed scores where direct arithmetic is accurate, if the DOCTOR order-key relationship failed, or if the bound above were violated by any pair of examples.
+        **An untested hypothesis, labelled as such.** A bidirectional GRU integrates the whole clip, so a stationary
+        broadband noise floor shifts *every* input to the recurrence and the perturbation can accumulate in the
+        state, whereas a convolutional trunk with a short receptive field (about $12$ frames in the baseline, Section
+        2) treats each patch locally and then pools coarsely. Nothing in this notebook tests that. It is recorded so
+        that a future experiment (noise-augmented training of both arms across several seeds) has a concrete
+        statement to confirm or reject.
         """),
 
-        code("""
-        # S4.1: K=4 Gaussian-mixture toy in d=5 with class overlap; multinomial logistic regression fit on n=80 rows.
-        # Separate calibration (n=400) and test (n=2000) sets are drawn independently of the training rows. Seed RNG_SEED+400.
-        from sklearn.linear_model import LogisticRegression
-        from src.calibration import temperature_scale
-        from scipy.special import logsumexp
+        code(r"""
+        # N1.3.3: how many training seeds would it take to see a difference this size? Illustrative sigma values, clearly labelled.
+        # Minimum detectable difference for a two-sided 5% test at 80% power, k seeds per arm: MDE(k) = (z_{0.975} + z_{0.8}) * sigma * sqrt(2/k).
+        zsum = stats.norm.ppf(0.975) + stats.norm.ppf(0.80)
+        leg_final = np.array([LEG[s].val_accuracy.iloc[-1] for s in (17, 18, 19)])
+        SIGMAS = {"legacy baseline, 3 seeds (different architecture)": leg_final.std(ddof=1),
+                  "wide, last-10-epoch sd (epoch noise, not seed noise)": SUMM.loc["wide", "sd(last 10 epochs)"],
+                  "gru, last-10-epoch sd (epoch noise, not seed noise)": SUMM.loc["gru", "sd(last 10 epochs)"]}
+        ks = np.array([1, 2, 3, 5, 10, 20, 40])
+        MDE = pd.DataFrame({name: zsum * s * np.sqrt(2 / ks) for name, s in SIGMAS.items()}, index=pd.Index(ks, name="seeds per arm"))
+        display(MDE.round(3))
+        target = abs(d_noise)
+        need = {name: int(np.ceil(2 * (zsum * s / target) ** 2)) for name, s in SIGMAS.items()}
+        for name, k in need.items():
+            print(f"seeds per arm needed to detect |Delta(noise_10)| = {target:.3f} if sigma = {SIGMAS[name]:.3f} ({name}): {k}")
+        check("N1.3.3a", abs(SIGMAS["legacy baseline, 3 seeds (different architecture)"] - np.std([0.3730, 0.5913, 0.3433], ddof=1)) < 1e-3, f"legacy seed sd = {leg_final.std(ddof=1):.4f}")
+        check("N1.3.3b", bool(np.all(np.diff(MDE.values, axis=0) < 0)), "MDE shrinks monotonically with seeds per arm (as 1/sqrt(k))")
+        check("N1.3.3c", all(k >= 1 for k in need.values()) and max(need.values()) > min(need.values()), f"seeds needed depend strongly on the unknown sigma: {min(need.values())} to {max(need.values())}")
+        note("N1.3.3d", "these sigmas are proxies from other quantities; NONE is an estimate of gru or wide seed-to-seed sd, which requires re-training")
+        """),
+
+        code(r"""
+        # Figure 3.3: minimum detectable accuracy difference versus seeds per arm, for three illustrative sigma values.
+        fig, ax = plt.subplots(figsize=(8.4, 4.4))
+        for (name, col), ls in zip(zip(MDE.columns, ["#7f7f7f", ACOL["wide"], ACOL["gru"]]), ["-", "--", ":"]):
+            ax.plot(MDE.index, MDE[name], color=col, ls=ls, marker="o", ms=4, label=name)
+        ax.axhline(target, color="r", lw=1); ax.text(40, target + 0.01, f"observed |Delta(noise_10)| = {target:.3f}", ha="right", color="r", fontsize=8)
+        ax.set_xscale("log"); ax.set_xlabel("seeds per arm (log)"); ax.set_ylabel("minimum detectable difference (80% power)")
+        ax.legend(fontsize=7.5); ax.set_title("Seed budget needed to settle the noise_10 tension (illustrative sigmas)")
+        varied("N1.3.f3", MDE.values)
+        savefig(fig, "fig3_3_seed_budget.png")
+        """),
+
+        md(r"""
+        ### How to read this chart
+
+        Each curve is the smallest true accuracy difference that a two-sided $5\%$ test would detect with $80\%$
+        power, $\mathrm{MDE}(k)=(z_{0.975}+z_{0.80})\,\sigma\sqrt{2/k}$, as a function of the number $k$ of independent
+        training runs per arm. The red line is the observed $|\Delta(\text{noise\_10})|$. A curve below the red line
+        means $k$ seeds are enough to resolve a difference that large. The three curves use three **different,
+        unverified** values of the seed-to-seed standard deviation $\sigma$, because none has been measured for
+        `gru` or `wide`: the grey curve borrows the spread of the legacy baseline's three seeds, the green and blue
+        ones borrow epoch-to-epoch noise. The lesson is the spread between curves: depending on $\sigma$, the number
+        of seeds required ranges from one to more than twenty, so the honest statement is "we do not know how many
+        seeds it takes", not "three is enough".
+
+        ## 4. Neural collapse: what the formulas say, what they require, and what our probes can and cannot show
+
+        ### 4.1 Order of business: preconditions before parallels
+
+        Neural collapse (NC) is a phenomenon of the *terminal phase of training* (TPT), and its metrics are defined
+        on *training-set* activations. Both facts constrain what we may say about our own numbers, and both are
+        stated here, **before** any figure or measurement is discussed, so that no later sentence can lean on a
+        parallel the definitions do not license. Sections 4.2 and 4.3 give the mathematics; Section 4.4 states the
+        precondition and the two measurement deviations; only then does Section 4.5 look at our data.
+
+        ### 4.2 NC1: within-class variability collapse
+
+        (Papyan, Han and Donoho, arXiv:2008.08186; turn 4.) Let there be $C$ classes and $N$ examples per class, and
+        let $h_{i,c}\in\mathbb{R}^p$ be the last-layer feature of example $i$ in class $c$. Define
+        $$\mu_G=\mathrm{Ave}_{i,c}\{h_{i,c}\},\qquad \mu_c=\mathrm{Ave}_i\{h_{i,c}\},$$
+        $$\Sigma_W=\mathrm{Ave}_{i,c}\big\{(h_{i,c}-\mu_c)(h_{i,c}-\mu_c)^\top\big\},\qquad
+        \Sigma_B=\mathrm{Ave}_c\big\{(\mu_c-\mu_G)(\mu_c-\mu_G)^\top\big\},$$
+        and the variability-collapse metric
+        $$\mathrm{NC}_1=\frac{1}{C}\,\mathrm{Tr}\!\big(\Sigma_W\,\Sigma_B^{\dagger}\big),$$
+        where $\dagger$ is the Moore-Penrose pseudo-inverse. Collapse means $\Sigma_W\to\mathbf 0$, hence
+        $\mathrm{NC}_1\to0$. Three properties follow directly and are worth having in hand because they decide how
+        the metric may be used. **(i) Scale invariance**: replacing $h\mapsto a h$ multiplies both $\Sigma_W$ and
+        $\Sigma_B$ by $a^2$, and $\Sigma_B^\dagger$ by $a^{-2}$, so $\mathrm{NC}_1$ is unchanged. A raw
+        within-class variance is *not* scale-free, so a large $\mathrm{Tr}\,\Sigma_W$ says nothing about collapse
+        unless it is compared with the between-class scale. **(ii) Rotation invariance**: $h\mapsto Qh$ with $Q$
+        orthogonal leaves it unchanged. **(iii) Quadratic scaling in the noise**: if $h=m+s\,\varepsilon$ with class
+        means $m$ fixed and within-class noise scaled by $s$, then $\Sigma_W\propto s^2$ and
+        $\mathrm{NC}_1\propto s^2$, so $\log\mathrm{NC}_1$ against $\log s$ has slope $2$.
+
+        ### 4.3 NC2: the simplex equiangular tight frame
+
+        (Turn 6.) The standard simplex ETF is the set of columns of
+        $$M^{*}=\sqrt{\tfrac{C}{C-1}}\Big(I-\tfrac{1}{C}\mathbf 1_C\mathbf 1_C^{\top}\Big),$$
+        and a general simplex ETF is $M=\alpha\,U\,M^{*}$ with $\alpha>0$ and $U^\top U=I$. Its columns have equal norm
+        and pairwise cosine exactly $-1/(C-1)$, the largest mutual angle that $C$ centred vectors can have. The paper
+        splits NC2 into two measurements on the centred class means $\mu_c-\mu_G$, with
+        $\cos_\mu(c,c')=\langle\mu_c-\mu_G,\mu_{c'}-\mu_G\rangle/(\lVert\mu_c-\mu_G\rVert\,\lVert\mu_{c'}-\mu_G\rVert)$:
+        $$\text{equinormness}=\frac{\mathrm{Std}_c\,\lVert\mu_c-\mu_G\rVert_2}{\mathrm{Avg}_c\,\lVert\mu_c-\mu_G\rVert_2},\qquad
+        \text{equiangularity}=\mathrm{Std}_{c\ne c'}\,\cos_\mu(c,c'),$$
+        and a third, maximal-angle measure, $\mathrm{Avg}_{c\ne c'}\,\big|\cos_\mu(c,c')+\tfrac{1}{C-1}\big|$. All three tend
+        to $0$ in TPT. One geometric fact matters for us: an ETF of $C=12$ classes spans $C-1=11$ dimensions. **In a
+        two-dimensional projection, 12 centred vectors cannot be equiangular at $-1/11$**, so the 2D versions of the
+        equiangularity and maximal-angle measures have a floor above zero that no amount of training can lower. The
+        fixture cell below computes that floor for the best-spread planar configuration (a regular 12-gon).
+        """),
+
+        code(r"""
+        # N1.4.1: NC formulas as code, verified on labelled FIXTURES (a simplex ETF and noise-scaled copies). Not evidence about speech.
+        def nc_stats(h, y):
+            # NC1, equinormness, equiangularity and maximal-angle measure for features h (n, p) with integer labels y.
+            h = np.asarray(h, dtype=float); classes = np.unique(y); C = len(classes)
+            mu_G = h.mean(0); mus = np.stack([h[y == c].mean(0) for c in classes])
+            Sw = sum((h[y == c] - mus[i]).T @ (h[y == c] - mus[i]) for i, c in enumerate(classes)) / len(h)   # Ave over all i,c
+            M = mus - mu_G; Sb = M.T @ M / C
+            nc1 = float(np.trace(Sw @ np.linalg.pinv(Sb)) / C)
+            norms = np.linalg.norm(M, axis=1); U = M / norms[:, None]
+            cs = (U @ U.T)[np.triu_indices(C, 1)]
+            return {"nc1": nc1, "equinorm": float(norms.std() / norms.mean()), "equiang": float(cs.std()),
+                    "maxangle": float(np.abs(cs + 1 / (C - 1)).mean()), "trSw": float(np.trace(Sw)), "trSb": float(np.trace(Sb))}
+
+        Ccl, Nper = 12, 10
+        Mstar = np.sqrt(Ccl / (Ccl - 1)) * (np.eye(Ccl) - np.ones((Ccl, Ccl)) / Ccl)     # columns = simplex ETF
+        gram = Mstar.T @ Mstar
+        check("N1.4.1a", np.allclose(np.linalg.norm(Mstar, axis=0), 1.0), "columns of M* have unit norm")
+        off = gram[~np.eye(Ccl, dtype=bool)]
+        check("N1.4.1b", np.allclose(off, -1 / (Ccl - 1)), f"pairwise cosine of M* columns = -1/(C-1) = {-1 / (Ccl - 1):.4f} exactly")
+        check("N1.4.1c", np.allclose(gram, Ccl / (Ccl - 1) * (np.eye(Ccl) - np.ones((Ccl, Ccl)) / Ccl)), "M*^T M* = C/(C-1) (I - 11^T/C): a tight frame")
+        check("N1.4.1d", np.linalg.matrix_rank(Mstar) == Ccl - 1, f"rank(M*) = {np.linalg.matrix_rank(Mstar)} = C-1: the simplex ETF spans 11 dimensions, not 2")
+
+        rngf = np.random.default_rng(RNG_SEED + 41)
+        y_fx = np.repeat(np.arange(Ccl), Nper)
+        eps = rngf.standard_normal((Ccl * Nper, Ccl))
+        for _c in range(Ccl):
+            eps[y_fx == _c] -= eps[y_fx == _c].mean(0)      # zero class means: only Sigma_W scales with s
+        base = 3.0 * Mstar.T[y_fx]                                   # alpha = 3, U = I
+        s_grid = np.array([1.0, 0.5, 0.25, 0.125, 0.0625])
+        nc1_s = np.array([nc_stats(base + s * eps, y_fx)["nc1"] for s in s_grid])
+        slope = np.polyfit(np.log(s_grid), np.log(nc1_s), 1)[0]
+        check("N1.4.1e", abs(slope - 2.0) < 0.05, f"fixture: log NC1 vs log(noise scale) has slope {slope:.3f} (theory 2)")
+        z0 = nc_stats(base, y_fx)
+        check("N1.4.1f", z0["nc1"] < 1e-12 and z0["equinorm"] < 1e-12 and z0["equiang"] < 1e-12 and z0["maxangle"] < 1e-12,
+              "fixture at zero within-class noise: NC1, equinormness, equiangularity and maximal-angle measure are all 0")
+        h_noisy = base + 0.5 * eps
+        Q, _ = np.linalg.qr(rngf.standard_normal((Ccl, Ccl)))
+        a0, a1, a2 = nc_stats(h_noisy, y_fx)["nc1"], nc_stats(7.3 * h_noisy, y_fx)["nc1"], nc_stats(h_noisy @ Q, y_fx)["nc1"]
+        check("N1.4.1g", abs(a1 / a0 - 1) < 1e-8 and abs(a2 / a0 - 1) < 1e-8, f"NC1 is scale-invariant and rotation-invariant (ratios {a1 / a0:.10f}, {a2 / a0:.10f})")
+        tr_ratio = nc_stats(7.3 * h_noisy, y_fx)["trSw"] / nc_stats(h_noisy, y_fx)["trSw"]
+        check("N1.4.1h", abs(tr_ratio - 7.3 ** 2) < 1e-6, f"whereas Tr(Sigma_W) is NOT scale-free: it grows by {tr_ratio:.2f} = 7.3^2 under a pure rescaling")
+
+        ang = np.arange(Ccl) * 2 * np.pi / Ccl
+        U2 = np.c_[np.cos(ang), np.sin(ang)]; cs2 = (U2 @ U2.T)[np.triu_indices(Ccl, 1)]
+        FLOOR2D = {"equiang": float(cs2.std()), "maxangle": float(np.abs(cs2 + 1 / (Ccl - 1)).mean())}
+        print("2D floor for a regular 12-gon of class means:", {k: round(v, 3) for k, v in FLOOR2D.items()})
+        check("N1.4.1i", FLOOR2D["equiang"] > 0.5 and FLOOR2D["maxangle"] > 0.5, "in two dimensions the equiangularity (0 at ETF) is >= 0.5 even for the best-spread planar arrangement: it cannot be read as 'not collapsed'")
+        """),
+
+        md(r"""
+        ### 4.4 The precondition (TPT) and the two measurement deviations, stated before any comparison
+
+        **Precondition: the terminal phase of training.** In the paper (turn 5) TPT is the post-zero-error phase: it
+        begins at the epoch where *in-sample training classification error first vanishes*, while training continues
+        to drive cross-entropy toward zero. The paper operationalises the effective start as training accuracy of
+        $99.6\%$ for ImageNet and $99.9\%$ for the other datasets. Neural collapse is a statement about behaviour
+        *inside* TPT; the metrics are snapshotted across the whole of training (300 epochs for ImageNet, 350 for the
+        other six datasets) so the paper can show them fall, but "collapse" is claimed only where the precondition
+        holds. A model that has not reached zero training error is not "failing to collapse": the quantity has no
+        claim on it.
+
+        **Deviation 1: training versus held-out data.** In the paper, $\mathrm{NC}_1$, $\mathrm{NC}_2$ and
+        $\mathrm{NC}_3$ are computed on **training-set activations**; only $\mathrm{NC}_4$ (agreement with the
+        nearest-class-centre rule) is evaluated on held-out data. Our probe is a fixed **120-sample held-out
+        split** (12 classes $\times$ 10 clips), not training activations. Held-out activations of a model that
+        generalises imperfectly scatter more than training activations, so our within-class spread is biased
+        upward against the paper's definition and the two are not the same quantity.
+
+        **Deviation 2: what the recorded features are.** Our 2D coordinates are a PCA projection of the classifier's
+        input (the penultimate features), not the paper's full $p$-dimensional last-layer features, and the
+        artifacts store only the 2D coordinates and two scalar cluster summaries in raw space, not the activations
+        themselves. Two measurements are therefore available: the paper's NC formulas applied to the **2D
+        coordinates**, and two **raw-space scalar summaries** whose ratio is a scale-free (but non-standard)
+        variability-to-separation number. Neither is the paper's $\mathrm{NC}_1$ in $p$ dimensions.
+
+        **Is a training run in TPT? A bound from the loss.** The artifacts do not record training accuracy, so
+        membership in TPT cannot be read off directly. What can be bounded: a misclassified example has some other class
+        $j$ with $p_j\ge p_y$, and $p_y+p_j\le1$ forces $p_y\le\tfrac12$, so its loss is at least $\ln2$. Averaging over
+        a training set,
+        $$\text{training error}\ \le\ \frac{\overline{\mathrm{CE}}}{\ln 2}.$$
+        This bound is only useful when it is small. It is also applied to the *recorded* training cross-entropy, which
+        is the running mean over minibatches of the last epoch in training mode, not an evaluation-mode pass, so
+        it is a heuristic, not a certificate.
+        """),
+
+        code(r"""
+        # N1.4.2: TPT status per arm from the recorded final training cross-entropy (bound err <= CE / ln 2).
+        rows = []
+        for a in ARCHS:
+            ce = DATA[a]["res"]["final_train_loss"]
+            rows.append({"arch": a, "final_train_CE": ce, "err_bound=CE/ln2": ce / np.log(2), "geo-mean p(true)=exp(-CE)": np.exp(-ce),
+                         "meets 0.1% operational TPT?": ce / np.log(2) <= 0.001})
+        TPT = pd.DataFrame(rows).set_index("arch")
+        display(TPT.round(4))
+        check("N1.4.2a", [round(TPT.loc[a, "final_train_CE"], 4) for a in ARCHS] == [0.0100, 0.9794, 0.0182], "final train CE: gru 0.0100, timepool 0.9794, wide 0.0182")
+        check("N1.4.2b", TPT.loc["gru", "err_bound=CE/ln2"] < 0.02 and TPT.loc["wide", "err_bound=CE/ln2"] < 0.03,
+              f"gru and wide: training error bounded by {TPT.loc['gru', 'err_bound=CE/ln2']:.2%} and {TPT.loc['wide', 'err_bound=CE/ln2']:.2%}: near, but not certified at, zero error")
+        check("N1.4.2c", TPT.loc["timepool", "err_bound=CE/ln2"] > 1.0, f"timepool: the bound is {TPT.loc['timepool', 'err_bound=CE/ln2']:.0%}, i.e. vacuous; nothing certifies zero training error")
+        check("N1.4.2d", not TPT["meets 0.1% operational TPT?"].any(), "no arm is CERTIFIED at the paper's 99.9% operational threshold by this bound (it could still be reached; training accuracy was not recorded)")
+        STATUS = {"gru": "TPT plausible, not certified", "wide": "TPT plausible, not certified", "timepool": "TPT not reached (working premise): NC undefined"}
+        note("N1.4.2e", "timepool: training accuracy is not recorded; we adopt 'zero training error not reached' as a premise supported by CE 0.9794 (true-class geometric-mean probability 0.376), not proved by it")
+        """),
+
+        code(r"""
+        # Figure 4.0: recorded training cross-entropy per epoch versus the level that would certify 99.9% training accuracy.
+        LEVEL = 0.001 * np.log(2)          # CE at which the error bound CE/ln2 equals the paper's 0.1% operational threshold
+        fig, ax = plt.subplots(figsize=(9.2, 4.5))
+        for a in ARCHS:
+            h_ = DATA[a]["res"]["history"]
+            ax.plot(np.arange(1, len(h_) + 1), [e["train_loss"] for e in h_], color=ACOL[a], lw=1.9, label=a)
+        ax.axhline(LEVEL, color="r", ls="--"); ax.text(1.5, LEVEL * 1.35, f"CE = 0.1% x ln 2 = {LEVEL:.5f}: the loss level at which the bound certifies 99.9% training accuracy", color="r", fontsize=8)
+        ax.set_yscale("log"); ax.set_xlabel("epoch"); ax.set_ylabel("training cross-entropy (epoch mean, log)"); ax.legend(fontsize=9)
+        ax.set_title("How far each arm's training loss is from a certifiable terminal phase")
+        ratio_ = {a: DATA[a]["res"]["final_train_loss"] / LEVEL for a in ARCHS}
+        check("N1.4.2f", min(ratio_.values()) > 5, f"final train CE is {ratio_['gru']:.0f}x (gru), {ratio_['wide']:.0f}x (wide), {ratio_['timepool']:.0f}x (timepool) above the certifying level: none is certified")
+        last5 = {a: [e["train_loss"] for e in DATA[a]["res"]["history"]][-5:] for a in ARCHS}
+        check("N1.4.2g", all(last5[a][-1] < last5[a][0] for a in ("gru", "wide")), "gru and wide training CE is still falling over the last five epochs (a terminal phase, if any, has only just begun)")
+        varied("N1.4.f0", [[e["train_loss"] for e in DATA[a]["res"]["history"]] for a in ARCHS])
+        savefig(fig, "fig4_0_train_ce_vs_tpt_level.png")
+        """),
+
+        md(r"""
+        ### How to read this chart
+
+        Training cross-entropy per epoch, one line per architecture, log axis; the red dashed line is the loss level
+        $0.001\ln2\approx0.0007$ below which the bound $\text{error}\le\mathrm{CE}/\ln2$ certifies the paper's $99.9\%$
+        operational threshold. `gru` and `wide` decline by two orders of magnitude and are still falling in the
+        last epochs, ending about $14$ and $26$ times above the red line, so "plausibly entering TPT" is the most this
+        chart supports. `timepool` stays near $1$ ($0.98$ at the end), three orders of magnitude above it. The chart is the honest
+        summary of Section 4.4: a terminal phase, if there is one, lies beyond where the two better arms stopped.
+        The runs lasted $28$ epochs (`gru`) and $36$ epochs (`wide`, `timepool`), against the $300$ to $350$ epochs
+        over which the paper snapshots its metrics.
+        """),
+
+        md(r"""
+        ### 4.5 What our probes show
+
+        With the precondition and both deviations on the table, the measurements can be read at the right strength.
+        The status assignment is: `gru` (train cross-entropy $0.0100$) and `wide` ($0.0182$) are *plausibly* in TPT;
+        `timepool` ($0.9794$) never reached zero training error, so **neural collapse is not defined for it**. Its
+        rising intra-class variance in the figures below is therefore recorded as a description of its geometry,
+        and is **not** to be described as a "failure to collapse". The metrics we compute per epoch are: the paper's
+        $\mathrm{NC}_1$ formula and the three NC2 measures applied to the 2D coordinates of the 120 held-out
+        probes; and, in raw space, the ratio $\rho_{\text{raw}}=\text{intra}_{\text{raw}}/\text{inter}_{\text{raw}}^2$,
+        where intra is the mean squared distance to the class centroid (equal to $\mathrm{Tr}\,\Sigma_W$ for balanced
+        classes) and inter is the mean pairwise centroid distance. $\rho_{\text{raw}}$ is scale-free and tracks
+        $\mathrm{Tr}\,\Sigma_W/\mathrm{Tr}\,\Sigma_B$ up to a constant; it is a crude cousin of $\mathrm{NC}_1$, not
+        $\mathrm{NC}_1$.
+        """),
+
+        code(r"""
+        # N1.4.3: per-epoch NC-type series for each arm from the real probes (held-out, 120 clips; 2D PCA coordinates + raw scalars).
+        NC = {}
+        for a in ARCHS:
+            z = DATA[a]["npz"]; E_ = len(z["inter_2d"]); y_ = z["labels"]
+            per = pd.DataFrame([nc_stats(z["coords_2d"][e].astype(float), y_) for e in range(E_)])
+            per["inter_2d"], per["intra_2d"] = z["inter_2d"], z["intra_2d"]
+            per["inter_raw"], per["intra_raw"] = z["inter_raw"], z["intra_raw"]
+            per["rho_raw"] = per["intra_raw"] / per["inter_raw"] ** 2
+            per["rho_2d"] = per["intra_2d"] / per["inter_2d"] ** 2
+            NC[a] = per
+        summ = pd.DataFrame({a: {"nc1_2d first": NC[a].nc1.iloc[0], "nc1_2d last": NC[a].nc1.iloc[-1], "rho_raw first": NC[a].rho_raw.iloc[0], "rho_raw last": NC[a].rho_raw.iloc[-1],
+                                 "rho_raw last/first": NC[a].rho_raw.iloc[-1] / NC[a].rho_raw.iloc[0], "equinorm last": NC[a].equinorm.iloc[-1],
+                                 "equiang(2D) last": NC[a].equiang.iloc[-1], "maxangle(2D) last": NC[a].maxangle.iloc[-1]} for a in ARCHS}).T
+        display(summ.round(3))
+        g, t, w_ = (DATA[a]["npz"] for a in ARCHS)
+        check("N1.4.3a", abs(g["inter_2d"][0] - 2.6) < 0.1 and abs(g["inter_2d"][-1] - 4.3) < 0.1, f"gru inter-cluster distance (2D) {g['inter_2d'][0]:.2f} -> {g['inter_2d'][-1]:.2f} (brief: 2.6 -> 4.3)")
+        check("N1.4.3b", abs(g["intra_2d"][0] - 6.7) < 0.1 and abs(g["intra_2d"].min() - 1.5) < 0.05, f"gru intra-cluster variance (2D) {g['intra_2d'][0]:.2f} -> min {g['intra_2d'].min():.2f}, last {g['intra_2d'][-1]:.2f} (brief's 1.5 is the minimum, not the last epoch)")
+        check("N1.4.3c", abs(t["intra_2d"][0] - 10) < 0.2 and abs(t["intra_2d"][-1] - 29) < 0.5, f"timepool intra (2D) {t['intra_2d'][0]:.1f} -> {t['intra_2d'][-1]:.1f} (max {t['intra_2d'].max():.1f}); brief: 10 -> 29")
+        check("N1.4.3d", abs(w_["intra_2d"].min() - 48) < 0.5 and abs(w_["intra_2d"].max() - 135) < 0.5, f"wide intra (2D) oscillates between {w_['intra_2d'].min():.1f} and {w_['intra_2d'].max():.1f} (brief: 48-135)")
+        check("N1.4.3e", NC["gru"].nc1.iloc[-1] < 0.2 * NC["gru"].nc1.iloc[0], f"gru 2D NC1-analogue falls {NC['gru'].nc1.iloc[0]:.3f} -> {NC['gru'].nc1.iloc[-1]:.3f}: NC1-consistent behaviour")
+        note("N1.4.3f", f"wide 2D NC1-analogue {NC['wide'].nc1.iloc[0]:.3f} -> {NC['wide'].nc1.iloc[-1]:.3f} (flat) while its raw-space ratio falls {NC['wide'].rho_raw.iloc[0]:.3f} -> {NC['wide'].rho_raw.iloc[-1]:.3f}: only weakly NC1-consistent, and only in raw space")
+        note("N1.4.3g", f"raw intra grows for EVERY arm (gru {g['intra_raw'][0]:.1f} -> {g['intra_raw'][-1]:.1f}) because feature scale grows; the scale-free ratio rho_raw is the meaningful one")
+        check("N1.4.3h", all(NC[a].equiang.iloc[-1] > 0.5 and NC[a].maxangle.iloc[-1] > 0.5 for a in ARCHS), "2D equiangularity / maximal-angle measures sit at their planar floor (>0.5) for all arms: uninformative about NC2 here")
+        """),
+
+        code(r"""
+        # Figure 4.1: final-epoch 2D geometry of the 120 held-out probes per arm, TPT status annotated.
+        fig, axs = plt.subplots(1, 3, figsize=(15, 4.9))
+        cmap = plt.get_cmap("tab20")
+        for ax, a in zip(axs, ARCHS):
+            z = DATA[a]["npz"]; xy = z["coords_2d"][-1]; y_ = z["labels"]
+            for c in range(12):
+                m_ = y_ == c
+                ax.scatter(xy[m_, 0], xy[m_, 1], s=16, color=cmap(c), alpha=0.85)
+                ax.scatter(*xy[m_].mean(0), s=90, marker="X", color=cmap(c), edgecolor="k", linewidth=0.7)
+            ax.set_title(f"{a}: last epoch ({len(z['inter_2d'])})", color=ACOL[a])
+            ax.text(0.02, 0.98, f"{STATUS[a]}\ntrain CE {DATA[a]['res']['final_train_loss']:.4f}\nheld-out probes, 2D PCA",
+                    transform=ax.transAxes, va="top", fontsize=8.5, bbox=dict(boxstyle="round", fc="white", ec=ACOL[a]))
+            ax.set_xlabel("PC 1"); ax.set_ylabel("PC 2")
+        fig.suptitle("Final 2D geometry of held-out probes (X = class centroid). Not training activations; NC is undefined for timepool.", y=1.02)
+        varied("N1.4.f1", [DATA[a]["npz"]["coords_2d"][-1] for a in ARCHS])
+        plt.tight_layout(); savefig(fig, "fig4_1_final_geometry.png")
+        """),
+
+        md(r"""
+        ### How to read this chart
+
+        Each panel is one architecture's last-epoch PCA projection of the classifier's input for the 120 held-out
+        probe clips; small dots are clips, coloured by class, and the large crosses are class centroids. Read
+        *separation between coloured groups* against *spread within one colour*. `gru` shows compact same-colour
+        groups spread across the plane; `wide` shows groups spread over a much larger extent (note the axis scale)
+        with heavier overlap; `timepool` shows large overlapping clouds. The annotation box states the
+        terminal-phase status of each arm. For `timepool` it reads "NC undefined": the arm never reached zero
+        training error, so the picture is a description of a model that has not begun TPT, and the overlap must not
+        be labelled a collapse failure. Because the probes are held-out and the projection is two-dimensional, this
+        is also not a picture of $\mathrm{NC}_2$: twelve classes cannot lie on an ETF in a plane.
+        """),
+
+        code(r"""
+        # Figure 4.2: trajectories of scale-aware and raw cluster summaries across epochs, per arm. timepool drawn dashed: NC undefined.
+        fig, axs = plt.subplots(2, 2, figsize=(13, 8))
+        panels = [("nc1", "NC1 formula on 2D coordinates (held-out)", False), ("rho_raw", "raw-space Tr(Sw)/inter^2 ratio  (scale-free)", True),
+                  ("intra_2d", "intra-cluster variance, 2D (NOT scale-free)", True), ("inter_2d", "inter-cluster distance, 2D", False)]
+        for ax, (col, ttl, logy) in zip(axs.ravel(), panels):
+            for a in ARCHS:
+                d = NC[a]
+                ax.plot(np.arange(1, len(d) + 1), d[col], color=ACOL[a], lw=1.8, ls="--" if a == "timepool" else "-",
+                        label=a + (" (NC undefined: TPT not reached)" if a == "timepool" else ""))
+            ax.set_title(ttl, fontsize=10); ax.set_xlabel("epoch")
+            if logy: ax.set_yscale("log")
+        axs[0, 0].legend(fontsize=8)
+        varied("N1.4.f2", [NC[a][c].values for a in ARCHS for c in ("nc1", "rho_raw", "intra_2d", "inter_2d")])
+        plt.tight_layout(); savefig(fig, "fig4_2_nc_trajectories.png")
+        """),
+
+        md(r"""
+        ### How to read this chart
+
+        Four panels, one line per architecture across its epochs; the `timepool` line is dashed and labelled because
+        neural collapse is undefined for it. Top-left is the paper's $\mathrm{NC}_1$ formula applied to the 2D
+        coordinates: only `gru` shows the monotone-looking fall toward zero that the definition describes ($0.46$ to
+        $0.03$); `wide` is flat and `timepool` is flat and high. Top-right is the scale-free raw-space ratio on a log
+        axis: **all three** arms fall, `gru` the most (about fivefold), `wide` about threefold, `timepool` also
+        about threefold (again, a description, not a collapse). Bottom-left is the raw 2D intra-cluster variance,
+        which the panel title flags as scale-dependent: `wide`'s $48$ to $135$ oscillation looks alarming in
+        absolute terms, but intra is a squared distance, so it should be set against the squared inter-cluster
+        distance (bottom-right, $5.8$ to $7.6$, squared about $33$ to $58$): the ratio is near $1.5$ and does not fall.
+        The ratio, not the level, is what NC1 measures. The caution to carry away: an absolute intra-cluster level cannot rank
+        architectures by collapse. What would make the `gru` reading wrong: the same fall on a training-set probe
+        being absent, or a fall driven purely by the projection changing between epochs (PCA is refit every epoch).
+        """),
+
+        code(r"""
+        # Figure 4.3: NC2-type measures in 2D versus their planar floor; equinormness trajectories.
+        fig, axs = plt.subplots(1, 2, figsize=(13, 4.4))
+        for a in ARCHS:
+            z = DATA[a]["npz"]; xy = z["coords_2d"][-1].astype(float); y_ = z["labels"]
+            mus = np.stack([xy[y_ == c].mean(0) for c in range(12)]); M_ = mus - xy.mean(0)
+            U_ = M_ / np.linalg.norm(M_, axis=1)[:, None]; cs_ = (U_ @ U_.T)[np.triu_indices(12, 1)]
+            axs[0].hist(cs_, bins=np.linspace(-1, 1, 21), alpha=0.45, color=ACOL[a], label=f"{a} (Std {cs_.std():.2f})")
+        axs[0].axvline(-1 / 11, color="r", lw=1.5); axs[0].text(-1 / 11 + 0.03, axs[0].get_ylim()[1] * 0.92, "-1/(C-1) = -0.091\n(ETF value)", color="r", fontsize=8)
+        axs[0].set_xlabel("pairwise cosine of centred class means (2D)"); axs[0].set_ylabel("number of class pairs"); axs[0].legend(fontsize=8)
+        axs[0].set_title("Last-epoch class-mean cosines in 2D vs the ETF value")
+        for a in ARCHS:
+            axs[1].plot(np.arange(1, len(NC[a]) + 1), NC[a].equinorm, color=ACOL[a], ls="--" if a == "timepool" else "-", lw=1.8, label=a)
+        axs[1].set_xlabel("epoch"); axs[1].set_ylabel("equinormness (Std/Avg of ||mu_c - mu_G||), 2D"); axs[1].legend(fontsize=8)
+        axs[1].set_title("Equinormness across epochs (2D, held-out)")
+        varied("N1.4.f3", [NC[a].equinorm.values for a in ARCHS])
+        plt.tight_layout(); savefig(fig, "fig4_3_nc2_2d.png")
+        """),
+
+        md(r"""
+        ### How to read this chart
+
+        Left: for each arm, a histogram of the $\binom{12}{2}=66$ pairwise cosines between centred class means at the
+        last epoch, in the 2D projection; the red line marks the ETF value $-1/11=-0.091$ at which every pair should
+        sit in TPT. In a plane the cosines must spread over the whole range $[-1,1]$ (the standard deviations printed in
+        the legend are all near $0.68$, close to the $0.668$ of a perfect regular 12-gon), so the histogram cannot
+        approach a spike at the red line for *any* model. The panel therefore demonstrates the floor, and should be read
+        as the reason the 2D NC2 numbers are not evidence. Right: equinormness, the coefficient of variation of the
+        centred-mean norms. It falls for all arms over training (roughly $0.8$-$1.0$ down to $0.5$-$0.65$), which is the
+        direction NC2 predicts but is also what a projection that spreads centroids more evenly would produce.
+
+        ### 4.6 What we may say
+
+        1. **Allowed**: `gru`, whose loss is consistent with near-zero training error, shows a fall in the paper's
+           $\mathrm{NC}_1$ formula and in a scale-free raw ratio on held-out probes. This is *NC1-consistent
+           behaviour*.
+        2. **Allowed, weaker**: `wide` shows a fall only in the raw ratio, not in the 2D $\mathrm{NC}_1$.
+        3. **Not allowed**: that `timepool` "failed to collapse". It never entered TPT, and the metric is not defined
+           on it. Its rising raw intra-cluster level is recorded as geometry.
+        4. **Not allowed**: any $\mathrm{NC}_2$ claim from 2D projections, since a plane cannot host an ETF of 12
+           classes.
+        5. **Not allowed**: to call any of this the paper's measurement. The paper measures training activations at
+           $p$ dimensions; we have held-out probes and a PCA projection. The parallel is an observation about
+           shape, in the direction the theory predicts, with no test of the theory.
+        """),
+
+        md(r"""
+        ### 4.7 Where these quantities live in notebook 04, and where they do not
+
+        **Provenance, stated once and plainly.** Every measured number in this notebook -- the accuracies, the
+        parameter counts, the clip rates, the fitted temperatures, the cluster geometry -- is read from the artifacts
+        of **notebook 04, `04_real_dataset_walkthrough.ipynb`**, via `runtime/metrics/arch-*.result.json` and
+        `arch-*.probes.npz`. This notebook trains nothing and measures nothing of its own. Notebook 04 is the
+        measurement; this notebook is the mathematics, and notebook 02 is the cheap sandbox that precedes both.
+
+        **The correspondence is partial, and the gap is worth naming.** Notebook 04 reports three families of
+        in-training diagnostic. Only one of them is what the neural-collapse formulas above describe:
+
+        | notebook 04 | what it measures | relation to $\mathrm{NC}_1$ / $\mathrm{NC}_2$ |
+        |---|---|---|
+        | V4 cluster health (`inter_2d`, `intra_2d`) | between- and within-class spread of penultimate features, per epoch | **the same family.** Its intra-cluster variance is a 2D, held-out analogue of $\Sigma_W$; its inter-cluster distance plays the role $\Sigma_B$ plays in $\mathrm{NC}_1$ |
+        | V3 latent scatter (`coords_2d`) | the projected features themselves | the raw material both $\mathrm{NC}_1$ and V4 are computed from |
+        | V5--V8 MM-PHATE (`mmphate_tensor`) | dispersion of **hidden units** across sequence steps and epochs | **a different object.** Neural collapse is a statement about final-layer *class* geometry at convergence; MM-PHATE's entropies are about *unit* trajectories through time. Neither theory grounds the other |
+
+        So the mathematics in this section founds notebook 04's V3 and V4, and does **not** found its V5--V8. Those
+        rest on MM-PHATE's own construction, cited there, and nothing in this notebook derives them. That is an
+        honest gap in the series rather than a claim of coverage, and it is repeated in section 8.
+        """),
+
+        code(r"""
+        # N1.4.7: verify the correspondence claim against the artifacts, rather than asserting it in prose.
         from scipy.stats import spearmanr
-
-        s_K4, s_d4 = 4, 5
-        s_rng4 = np.random.default_rng(RNG_SEED + 400)
-        s_centers4 = s_rng4.standard_normal((s_K4, s_d4))
-
-        def s_draw4(n):
-            y = s_rng4.integers(0, s_K4, n)
-            return s_centers4[y] + s_rng4.standard_normal((n, s_d4)), y
-
-        s_Xtr4, s_ytr4 = s_draw4(80)
-        s_Xca4, s_yca4 = s_draw4(400)
-        s_Xte4, s_yte4 = s_draw4(2000)
-        s_clf4 = LogisticRegression(C=5.0, max_iter=5000).fit(s_Xtr4, s_ytr4)
-        s_zca4 = s_clf4.decision_function(s_Xca4)
-        s_zte4 = s_clf4.decision_function(s_Xte4)
-        s_correct4 = np.argmax(s_zte4, axis=1) == s_yte4
-        s_train_acc4 = s_clf4.score(s_Xtr4, s_ytr4)
-
-        check("S4.1a", int(np.sum(~s_correct4)) >= 100,
-              f"test set has {int(np.sum(~s_correct4))} errors of {len(s_correct4)} (>= 100 needed for a non-degenerate RC curve)")
-        check("S4.1b", s_train_acc4 > float(np.mean(s_correct4)),
-              f"train accuracy {s_train_acc4:.3f} > held-out accuracy {np.mean(s_correct4):.3f}: the finite-sample fit is overconfident on new rows")
-
-        print(f"Toy: K={s_K4}, d={s_d4}, train n=80, calibration n=400, test n=2000")
-        print(f"  test error = {np.mean(~s_correct4):.3f}; logit range on test = [{s_zte4.min():.2f}, {s_zte4.max():.2f}]")
+        # For each arm: does notebook 04's stored intra_2d behave like a within-class scatter computed
+        # directly from its stored coords_2d? If the two disagree, the table above is wrong.
+        rows = []
+        for a in ARCHS:
+            n = DATA[a]["npz"]
+            coords, labels = n["coords_2d"], n["labels"]
+            recomputed = []
+            for t in range(coords.shape[0]):
+                pts = coords[t]
+                within = np.concatenate([pts[labels == c] - pts[labels == c].mean(axis=0)
+                                         for c in np.unique(labels)])
+                recomputed.append(float((within ** 2).sum(axis=1).mean()))
+            recomputed = np.asarray(recomputed)
+            stored = n["intra_2d"]
+            rho = float(spearmanr(recomputed, stored).statistic)
+            rows.append({"arch": a, "epochs": len(stored), "rho(recomputed, stored intra_2d)": rho,
+                         "stored first": float(stored[0]), "stored last": float(stored[-1]),
+                         "train_CE": DATA[a]["res"]["final_train_loss"],
+                         "in_TPT": "no" if DATA[a]["res"]["final_train_loss"] > 0.1 else "plausibly"})
+            check(f"N1.4.7[{a}.same_family]", rho > 0.9,
+                  f"within-class scatter recomputed from coords_2d tracks stored intra_2d (Spearman rho={rho:+.3f})")
+        CORR = pd.DataFrame(rows).set_index("arch")
+        display(CORR.round(4))
+        note("N1.4.7[mmphate]", "no quantity derived in this section founds notebook 04's V5-V8 MM-PHATE statistics; "
+                               "they measure hidden-unit dispersion across sequence steps, not final-layer class geometry")
         """),
 
-        code("""
-        # S4.2: Stable SR ranking keys, validated against displayed softmax scores where direct arithmetic is accurate.
-        def s_gaps4(z):
-            zs = -np.sort(-z, axis=1)
-            return zs[:, :1] - zs[:, 1:]  # d_k = z(1) - z(k), k = 2..K; column 0 is the confidence margin.
-
-        def s_log_keys4(z, lam):
-            # Returns log(1 - actual SR_max), a stable DOCTOR confidence key, and log(H).
-            D = lam * s_gaps4(z)
-            logS = logsumexp(-D, axis=1)
-            l1pS = np.log1p(np.exp(logS))  # log(1 + S)
-            l_max = logS - l1pS
-            logQ = logsumexp(-2.0 * D, axis=1)
-            # -s_doctor = R / (1 + Q), R = 2S + (S² - Q).
-            # Evaluate log(S²-Q) from distinct pairs to avoid cancellation at large lambda.
-            s_pair_i4, s_pair_j4 = np.triu_indices(D.shape[1], k=1)
-            if len(s_pair_i4):
-                logX = np.log(2.0) + logsumexp(-D[:, s_pair_i4] - D[:, s_pair_j4], axis=1)
-            else:
-                logX = np.full(len(D), -np.inf)
-            logR = np.logaddexp(np.log(2.0) + logS, logX)
-            doctor_log_magnitude = logR - np.logaddexp(0.0, logQ)
-            doctor_order_key = -doctor_log_magnitude
-            logT = logsumexp(-D + np.log(np.maximum(D, 1e-300)), axis=1)
-            l_log1p = np.where(logS < -30, logS, np.log(np.maximum(l1pS, 1e-300)))
-            l_ent = np.logaddexp(l_log1p, logT - l1pS)
-            return {"SR_max": l_max, "doctor_order_key": doctor_order_key,
-                    "doctor_log_magnitude": doctor_log_magnitude, "SR_ent": l_ent}
-
-        def s_direct4(z, lam):
-            a = lam * z
-            a = a - a.max(axis=1, keepdims=True)
-            p = np.exp(a)
-            p /= p.sum(axis=1, keepdims=True)
-            return {"SR_max": p.max(axis=1), "SR_doctor": 1 - 1.0 / (p ** 2).sum(axis=1),
-                    "SR_ent": (p * np.log(np.clip(p, 1e-300, 1))).sum(axis=1)}
-
-        s_lam_val4 = 0.5
-        s_lc4 = s_log_keys4(s_zte4, s_lam_val4)
-        s_dr4 = s_direct4(s_zte4, s_lam_val4)
-        s_rel_err4 = {}
-        s_stable4 = {"SR_max": -np.expm1(s_lc4["SR_max"]),
-                     "SR_doctor": -np.exp(s_lc4["doctor_log_magnitude"]),
-                     "SR_ent": -np.exp(s_lc4["SR_ent"])}
-        s_key_for_rc4 = lambda vals, name: vals["doctor_order_key"] if name == "SR_doctor" else -vals[name]
-        for s_name in s_dr4:
-            s_ok = np.abs(s_dr4[s_name]) > 1e-9
-            s_rel_err4[s_name] = float(np.max(np.abs(s_stable4[s_name][s_ok] - s_dr4[s_name][s_ok]) / np.abs(s_dr4[s_name][s_ok])))
-            check(f"S4.2-{s_name}", s_rel_err4[s_name] < 1e-8 and s_ok.mean() > 0.99,
-                  f"stable log-domain score vs direct displayed score at lambda={s_lam_val4}: max rel. error {s_rel_err4[s_name]:.1e} on {s_ok.mean():.1%} of rows (< 1e-8)")
-        s_doc_key4 = s_lc4["doctor_order_key"]
-        s_doctor_from_key4 = -np.exp(-s_doc_key4)
-        s_doc_order_ok4 = np.array_equal(np.argsort(s_doctor_from_key4), np.argsort(s_doc_key4))
-        check("S4.2-doctor-order", s_doc_order_ok4 and np.allclose(s_doctor_from_key4, s_stable4["SR_doctor"], atol=0, rtol=0),
-              f"doctor_order_key=-log(-s_doctor) ranks actual s_doctor=-exp(-doctor_order_key) identically at lambda={s_lam_val4}")
-
-        s_lam_grid4 = np.array([0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0])
-        s_keys4 = {lam: s_log_keys4(s_zte4, lam) for lam in s_lam_grid4}
-        s_margin4 = s_gaps4(s_zte4)[:, 0]
-        # At lambda=1000 the direct displayed SR_max rounds to exactly 1 for many rows; the log-complement key preserves its ordering.
-        s_direct_big = s_direct4(s_zte4, 1000.0)["SR_max"]
-        print(f"At lambda=1000, direct SR_max rounds to exactly 1 for {np.mean(s_direct_big == 1):.1%} of rows (ties from rounding);")
-        print(f"the log-domain log-complement key, used to recover/rank actual SR_max, has {len(np.unique(s_keys4[1000.0]['SR_max']))} distinct values out of {len(s_margin4)}.")
+        code(r"""
+        # N1.4.8: the same picture as a figure -- stored intra_2d against the scatter recomputed from coords_2d.
+        fig, axes = plt.subplots(1, 3, figsize=(13, 3.6))
+        for ax, a in zip(axes, ARCHS):
+            n = DATA[a]["npz"]
+            coords, labels = n["coords_2d"], n["labels"]
+            rec = np.asarray([float((np.concatenate([coords[t][labels == c] - coords[t][labels == c].mean(axis=0)
+                                                     for c in np.unique(labels)]) ** 2).sum(axis=1).mean())
+                              for t in range(coords.shape[0])])
+            ep = np.arange(len(rec))
+            varied(f"{a} intra_2d", rec, n["intra_2d"])
+            ax.plot(ep, n["intra_2d"], color=ACOL[a], lw=2, label="stored intra_2d (notebook 04 V4)")
+            ax.plot(ep, rec, color="black", lw=1, ls="--", label="recomputed from coords_2d")
+            tpt = DATA[a]["res"]["final_train_loss"] <= 0.1
+            ax.set(title=f"{a} - {'plausibly in TPT' if tpt else 'never reached TPT'}",
+                   xlabel="epoch", ylabel="within-class scatter (2D)")
+            ax.grid(alpha=0.3); ax.legend(fontsize=7)
+        fig.suptitle("Notebook 04's V4 intra-cluster variance is a within-class scatter: "
+                     "the NC1 numerator's 2D, held-out analogue", y=1.04)
+        savefig(fig, "fig4_4_nc1_vs_nb04_v4.png")
         """),
 
-        code("""
-        # S4.2b: Worked numeric example, K=3, two rows whose SR_max order disagrees with the margin order at lambda=1 (no randomness).
-        s_row_a = np.array([[3.0, 2.0, -9.0]])   # margin 1.0, but the runner-up logit is close to the top one
-        s_row_b = np.array([[1.5, 0.0, 0.0]])    # margin 1.5, two runners-up
-        s_marg_a, s_marg_b = float(s_gaps4(s_row_a)[0, 0]), float(s_gaps4(s_row_b)[0, 0])
-        # Hand arithmetic: SR_max = 1/(1+S) with S = sum_k exp(-lambda d_k).
-        def s_hand_srmax(z, lam):
-            d = z[0].max() - np.sort(z[0])[::-1][1:]
-            return 1.0 / (1.0 + np.exp(-lam * d).sum())
-        s_ha1, s_hb1 = s_hand_srmax(s_row_a, 1.0), s_hand_srmax(s_row_b, 1.0)
-        s_ha10, s_hb10 = s_hand_srmax(s_row_a, 10.0), s_hand_srmax(s_row_b, 10.0)
-        s_la10 = -s_log_keys4(s_row_a, 10.0)["SR_max"][0]
-        s_lb10 = -s_log_keys4(s_row_b, 10.0)["SR_max"][0]
-
-        check("S4.2b-flip", s_marg_b > s_marg_a and s_ha1 > s_hb1,
-              f"lambda=1: margin(b)={s_marg_b:.1f} > margin(a)={s_marg_a:.1f} but SR_max(a)={s_ha1:.4f} > SR_max(b)={s_hb1:.4f} (orders disagree)")
-        check("S4.2b-agree", s_hb10 > s_ha10 and s_lb10 > s_la10 and 10.0 * (s_marg_b - s_marg_a) > np.log(2.0),
-              f"lambda=10: SR_max(b)={s_hb10:.6f} > SR_max(a)={s_ha10:.6f}, log-complement keys agree ({s_lb10:.2f} > {s_la10:.2f}); "
-              f"bound premise lambda*(gap)={10.0 * (s_marg_b - s_marg_a):.1f} > log(K-1)={np.log(2.0):.2f}")
-        print("Row a: logits [3, 2, -9]; row b: logits [1.5, 0, 0]. The third logit of row b adds a second runner-up, which lowers its softmax mass on the top class at small scale.")
-        """),
-
-        code("""
-        # S4.3: RC curves and AURC of SR scores versus margin over the lambda grid (test set of S4.1, no randomness).
-        s_aurc_sr4 = {name: [] for name in ["SR_max", "SR_doctor", "SR_ent"]}
-        s_aurc_margin4 = []
-        s_risk_margin4 = []
-        s_risk_srmax4 = []
-        for lam in s_lam_grid4:
-            for name in s_aurc_sr4:
-                s_aurc_sr4[name].append(aurc(*risk_coverage_curve(s_key_for_rc4(s_keys4[lam], name), s_correct4)))
-            s_cov_m, s_risk_m = risk_coverage_curve(lam * s_margin4, s_correct4)  # margin score at scale lambda
-            s_risk_margin4.append(s_risk_m)
-            s_aurc_margin4.append(aurc(s_cov_m, s_risk_m))
-            s_risk_srmax4.append(risk_coverage_curve(-s_keys4[lam]["SR_max"], s_correct4)[1])
-
-        s_margin_dev4 = max(float(np.max(np.abs(r - s_risk_margin4[0]))) for r in s_risk_margin4)
-        s_i_lo, s_i_hi = 0, int(np.where(s_lam_grid4 == 10.0)[0][0])
-        s_srmax_dev4 = float(np.max(np.abs(s_risk_srmax4[s_i_lo] - s_risk_srmax4[s_i_hi])))
-        s_rho_max_1, _ = spearmanr(-s_keys4[1.0]["SR_max"], s_margin4)
-
-        check("S4.3a", s_margin_dev4 < 1e-12,
-              f"margin RC curve identical across all {len(s_lam_grid4)} scales: max |risk diff| = {s_margin_dev4:.1e} (< 1e-12)")
-        check("S4.3b", s_srmax_dev4 > 0.0 and s_rho_max_1 < 1 - 1e-3,
-              f"SR_max RC curve changes with scale: max |risk diff| lambda=0.1 vs 10 is {s_srmax_dev4:.4f}; Spearman(SR_max, margin) at lambda=1 is {s_rho_max_1:.4f} (< 0.999)")
-
-        print("AURC over the lambda grid (lower is better):")
-        print("  lambda     " + " ".join(f"{l:8g}" for l in s_lam_grid4))
-        for name in s_aurc_sr4:
-            print(f"  {name:10s} " + " ".join(f"{a:8.4f}" for a in s_aurc_sr4[name]))
-        print("  margin     " + " ".join(f"{a:8.4f}" for a in s_aurc_margin4))
-        """),
-
-        code("""
-        # S4.4: Lemma 3.1 on the grid lambda in [0.1, 1000]: Spearman(SR score, margin) and the pairwise bound for SR_max.
-        s_rho4 = {name: [] for name in ["SR_max", "SR_doctor", "SR_ent"]}
-        for lam in s_lam_grid4:
-            for name in s_rho4:
-                s_rho4[name].append(float(spearmanr(s_key_for_rc4(s_keys4[lam], name), s_margin4)[0]))
-
-        s_i1 = int(np.where(s_lam_grid4 == 1.0)[0][0])
-        s_tol_rho = 1e-4  # from the bound: disagreement only inside a margin window of width log(K-1)/lambda (about 1e-3 at lambda=1000)
-        for name in s_rho4:
-            check(f"S4.4-{name}", s_rho4[name][-1] >= 1 - s_tol_rho and s_rho4[name][-1] >= s_rho4[name][s_i1],
-                  f"Spearman with margin: lambda=1 -> {s_rho4[name][s_i1]:.6f}, lambda=1000 -> {s_rho4[name][-1]:.6f} (need >= {1 - s_tol_rho} and no lower than at lambda=1)")
-
-        # Pairwise bound for SR_max on a 600-row subsample: pairs with lambda*(gap in margin) > log(K-1) must agree in order.
-        s_sub4 = np.random.default_rng(RNG_SEED + 404).choice(len(s_margin4), 600, replace=False)
-        s_viol_total, s_pairs_total = 0, 0
-        for lam in s_lam_grid4:
-            s_key_sub = -s_keys4[lam]["SR_max"][s_sub4]
-            s_dm = s_margin4[s_sub4][:, None] - s_margin4[s_sub4][None, :]
-            s_mask = lam * s_dm > np.log(s_K4 - 1)
-            s_dk = s_key_sub[:, None] - s_key_sub[None, :]
-            s_viol_total += int(np.sum(s_mask & (s_dk <= 0)))
-            s_pairs_total += int(np.sum(s_mask))
-        check("S4.4-bound", s_viol_total == 0 and s_pairs_total > 10_000,
-              f"pairwise bound lambda*(d2-d2') > log(K-1) => same SR_max order: {s_viol_total} violations among {s_pairs_total} qualifying pairs over the grid")
-
-        # Largest rank displacement (in positions out of n) between each SR ordering and the margin ordering, at lambda=1 and lambda=100.
-        def s_max_displacement(key, ref):
-            return int(np.max(np.abs(np.argsort(np.argsort(key)) - np.argsort(np.argsort(ref)))))
-        s_disp = {lam: {name: s_max_displacement(s_key_for_rc4(s_keys4[lam], name), s_margin4) for name in s_rho4} for lam in (1.0, 100.0)}
-        print(f"Largest rank displacement vs margin ordering (n={len(s_margin4)} rows): lambda=1 {s_disp[1.0]}, lambda=100 {s_disp[100.0]}")
-        check("S4.4-disp", all(s_disp[100.0][nm] <= s_disp[1.0][nm] for nm in s_rho4),
-              "largest rank displacement does not grow from lambda=1 to lambda=100 for any SR score")
-
-        print("Spearman correlation of SR score with confidence margin:")
-        print("  lambda     " + " ".join(f"{l:9g}" for l in s_lam_grid4))
-        for name in s_rho4:
-            print(f"  {name:10s} " + " ".join(f"{r:9.6f}" for r in s_rho4[name]))
-        """),
-
-        # ─────────────────────────────────────────────────────────────────────────────────
-        # Plot 2: SR and margin AURC across scales
-        # ─────────────────────────────────────────────────────────────────────────────────
-
-        code("""
-        # S4.5: AURC and rank disagreement versus logit scale (from S4.3-S4.4; K=4 toy, n=2000 test rows).
-        plt.figure(figsize=(11, 5.2))
-        plt.subplot(1, 2, 1)
-        plt.plot(s_lam_grid4, s_aurc_sr4["SR_max"], marker="o", label="SR_max", linewidth=2.2, color=PALETTE["clean"])
-        plt.plot(s_lam_grid4, s_aurc_sr4["SR_doctor"], marker="^", label="SR_doctor", linewidth=2.2, color=PALETTE["acoustic"])
-        plt.plot(s_lam_grid4, s_aurc_sr4["SR_ent"], marker="d", label="SR_ent", linewidth=2.2, color=PALETTE["shifted"])
-        plt.plot(s_lam_grid4, s_aurc_margin4, marker="s", label="Margin (conf-M)", linewidth=2.2, color=PALETTE["frozen"], linestyle="--")
-        plt.xscale("log")
-        plt.xlabel("Logit scale λ (log axis)", fontsize=12)
-        plt.ylabel("AURC (lower is better)", fontsize=12)
-        plt.title("AURC versus logit scale", fontsize=13, fontweight="bold")
-        plt.legend(fontsize=10)
-
-        plt.subplot(1, 2, 2)
-        s_floor4 = 1e-7
-        for name, marker, colour in [("SR_max", "o", "clean"), ("SR_doctor", "^", "acoustic"), ("SR_ent", "d", "shifted")]:
-            plt.plot(s_lam_grid4, np.maximum(1 - np.array(s_rho4[name]), s_floor4), marker=marker, label=name, linewidth=2.2, color=PALETTE[colour])
-        plt.axhline(s_floor4, color=PALETTE["reference"], linestyle=":", linewidth=1.5, label="floor (identical ranking)")
-        plt.xscale("log")
-        plt.yscale("log")
-        plt.xlabel("Logit scale λ (log axis)", fontsize=12)
-        plt.ylabel("1 − Spearman(SR, margin) (log axis)", fontsize=12)
-        plt.title("Lemma 3.1: rank disagreement", fontsize=13, fontweight="bold")
-        plt.legend(fontsize=9)
-        plt.tight_layout()
-        plt.show()
-
-        s_first_floor4 = {name: next((float(l) for l, r in zip(s_lam_grid4, s_rho4[name]) if 1 - r <= s_floor4), None) for name in s_rho4}
-        print("Smallest grid scale at which the SR ordering equals the margin ordering (None = not reached on the grid):", s_first_floor4)
-        """),
-
-        md("""
+        md(r"""
         ### How to read this chart
 
-        The figure has two panels that share the same logit-scale axis (logarithmic, from 0.1 to 1000), computed on one fixed classifier and one fixed test set.
-
-        **Left panel (AURC versus scale).** The y-axis is AURC, so lower is better. The three solid curves are the SR scores; the dashed line is the confidence margin, which is flat by construction because scaling the margin does not change its ordering. A solid curve that sits above the dashed line at some scale means that the SR score keeps errors out of the retained set less effectively than the margin at that scale; a curve below it means the reverse. Whether SR is above or below the margin at moderate scales is a property of this classifier and this draw, so read the printed table rather than assuming a sign. What must hold for every draw is that the SR curves are not identical across scales while the margin line is.
-
-        **Right panel (rank disagreement).** The y-axis is one minus the Spearman rank correlation between an SR score and the margin, on a logarithmic axis, so lower means closer agreement with the margin ordering. The dotted floor marks a point where the two orderings are identical on this test set (a value of exactly one minus one cannot be drawn on a log axis, so it is clipped to the floor). Lemma 3.1 predicts curves that fall toward the floor as the scale grows; a curve that rose at large scale would contradict it.
-
-        **Takeaway.** SR scores rank examples differently at different logit scales, so an SR-based RC curve depends on how the logits happen to be scaled, for instance by temperature scaling or training length. The margin does not. At sufficiently large scale the SR orderings collapse onto the margin ordering, so the two families differ only at the moderate scales that trained networks typically occupy. That last sentence is a statement about this toy; the paper's evidence for real networks is in its experiments (L pp.10-14).
-        """),
-
-        md("""
-        ### Temperature scaling as a global rescale (derived here)
-
-        Dividing all logits by a fitted temperature $T$ is the same operation as multiplying them by $\\lambda = 1/T$. It therefore leaves the predicted class unchanged and leaves the margin ordering unchanged, but it can change every SR ordering. The paper cites Zhu et al. (2022) as reporting that recent calibration methods may degrade selective-classification performance (L p.4); that is a cited claim, and this toy does not test it. What the toy can test is the mechanism: a calibration step that is harmless for accuracy can still move the RC curve of an SR score.
-
-        The temperature is fitted on a **separate calibration set** by minimizing negative log-likelihood, using the project's `temperature_scale`. For the fit to mean anything the training data must not be separable: with a separable classifier the likelihood keeps improving as $T \\to 0$, and the fitted $T$ is an artefact of the optimizer's bounds. The toy in S4.1 has overlapping classes for that reason, and the first check below asserts that the fitted $T$ is neither $1$ nor at a boundary.
-
-        The paired bootstrap used below resamples **rows** of the test set once per replicate and recomputes both AURCs on the same resample, so the interval for a difference of AURCs reflects the shared rows rather than treating the two scores as independent.
-        """),
-
-        code("""
-        # S4.6: Temperature fit on the calibration set, applied to the test set; paired bootstrap of AURC differences (B=400, seed RNG_SEED+406).
-        from src.metrics import nll
-
-        def s_softmax4(z):
-            a = z - z.max(axis=1, keepdims=True)
-            p = np.exp(a)
-            return p / p.sum(axis=1, keepdims=True)
-
-        def s_aurc_of(score, correct):
-            return aurc(*risk_coverage_curve(score, correct))
-
-        def s_paired_boot(score_a, score_b, correct, B=400, seed=0):
-            # Bootstrap rows jointly; returns (point, lower, upper) for AURC(score_a) - AURC(score_b) on the same resample.
-            rng = np.random.default_rng(seed)
-            n = len(correct)
-            diffs = np.empty(B)
-            for b in range(B):
-                idx = rng.integers(0, n, n)
-                diffs[b] = s_aurc_of(score_a[idx], correct[idx]) - s_aurc_of(score_b[idx], correct[idx])
-            lo, hi = np.quantile(diffs, [0.025, 0.975])
-            return s_aurc_of(score_a, correct) - s_aurc_of(score_b, correct), float(lo), float(hi)
-
-        s_T4 = temperature_scale(s_zca4, s_yca4)
-        s_nll_1 = nll(s_softmax4(s_zte4), s_yte4)
-        s_nll_T = nll(s_softmax4(s_zte4 / s_T4), s_yte4)
-        check("S4.6a", 1.05 < s_T4 < 20.0 and s_nll_T < s_nll_1,
-              f"fitted T={s_T4:.3f} is interior (not 1, not at the search bounds) and held-out test NLL improves {s_nll_1:.4f} -> {s_nll_T:.4f}")
-
-        s_zte4_T = s_zte4 / s_T4
-        s_margin_T = s_gaps4(s_zte4_T)[:, 0]
-        s_pred_same = np.array_equal(np.argmax(s_zte4, axis=1), np.argmax(s_zte4_T, axis=1))
-        s_risk_m1 = risk_coverage_curve(s_margin4, s_correct4)[1]
-        s_risk_mT = risk_coverage_curve(s_margin_T, s_correct4)[1]
-        s_margin_T_dev = float(np.max(np.abs(s_risk_m1 - s_risk_mT)))
-        check("S4.6b", s_pred_same and s_margin_T_dev < 1e-12,
-              f"predictions identical for every test row: {s_pred_same}; margin RC curve before/after T differs by {s_margin_T_dev:.1e} (< 1e-12)")
-
-        s_srmax_1 = -s_log_keys4(s_zte4, 1.0)["SR_max"]
-        s_srmax_T = -s_log_keys4(s_zte4, 1.0 / s_T4)["SR_max"]
-        s_rho_T = float(spearmanr(s_srmax_1, s_srmax_T)[0])
-        s_risk_s1 = risk_coverage_curve(s_srmax_1, s_correct4)[1]
-        s_risk_sT = risk_coverage_curve(s_srmax_T, s_correct4)[1]
-        s_srT_dev = float(np.max(np.abs(s_risk_s1 - s_risk_sT)))
-        check("S4.7", s_rho_T < 1 - 1e-9 and s_srT_dev > 0.0,
-              f"SR_max ordering changes under T: Spearman(before, after) = {s_rho_T:.6f}; max |risk diff| along the RC curve = {s_srT_dev:.4f}")
-
-        s_d1 = s_paired_boot(s_srmax_T, s_srmax_1, s_correct4, seed=RNG_SEED + 406)
-        s_d2 = s_paired_boot(s_margin4, s_srmax_T, s_correct4, seed=RNG_SEED + 407)
-        note("S4.8a", f"AURC(SR_max after T) - AURC(SR_max before): {s_d1[0]:+.4f}, paired-bootstrap 95% CI [{s_d1[1]:+.4f}, {s_d1[2]:+.4f}]"
-             + (" (CI excludes 0)" if s_d1[1] > 0 or s_d1[2] < 0 else " (CI contains 0: no detectable AURC change on this toy)"))
-        note("S4.8b", f"AURC(margin) - AURC(SR_max after T): {s_d2[0]:+.4f}, paired-bootstrap 95% CI [{s_d2[1]:+.4f}, {s_d2[2]:+.4f}]"
-             + (" (CI excludes 0)" if s_d2[1] > 0 or s_d2[2] < 0 else " (CI contains 0)"))
-        """),
-
-        # ─────────────────────────────────────────────────────────────────────────────────
-        # Section 4b: Covariate shift and novel-class inputs (derived here)
-        # ─────────────────────────────────────────────────────────────────────────────────
-
-        md("""
-        ## 4b. Selection under covariate shift and novel-class inputs (derived here; the paper's own experiments are vision and text, L)
-
-        The paper distinguishes three kinds of prediction error (L p.2): **Type A** errors on in-distribution inputs, **Type B** errors on inputs whose label is *not in the classifier's label set* (a novel label, so the prediction is always wrong), and **Type C** errors on covariate-shifted inputs that keep the same label set. Its generalization of selective classification to shifted data, Eq. (8), re-defines coverage and selection risk under the shifted distribution $D'$ and assumes that no outliers are present (L p.4). Our toy makes the same three types concrete and then goes one step beyond the paper's formal setting by also pooling Type B rows into the RC curve, to see what an outlier does to each score.
-
-        **Paraphrase of Liang et al. Eq. (8); L p.4.** Under $D'$ the coverage is $\\varphi' = \\mathbb{E}_{D'}[g(x)]$ and the selection risk is $R' = \\mathbb{E}_{D'}[\\ell(f(x), y)\\, g(x)] / \\varphi'$, with the assumption that $D'$ contains no outliers.
-
-        The paper reports (L pp.12-14) that margin scores are best or comparable to SR scores, that OOD-detection scores (it lists RL_max, Energy, KNN and ViM) perform poorly for selective classification, and that on iWildCam (images) and Amazon (text) the margin scores are only on par with SR scores. We test a narrow version of that comparison on a toy with $K = 3$ known classes, using only the two OOD-style scores that can be computed from logits alone: **RL_max** (the largest logit) and **Energy** ($\\log \\sum_k e^{z_k}$, larger meaning more in-distribution). KNN and ViM need training features and are **not run**, so nothing below says anything about them.
-
-        ### Toy data-generating process
-
-        Three known classes sit at the corners of an equilateral triangle of circumradius 2 in the plane. A multinomial logistic regression is fit on 300 in-distribution rows. Test rows are then drawn independently of the training rows:
-
-        1. **Type A:** same distribution as training (isotropic noise with standard deviation 1).
-        2. **Type C:** same class centres and label set, but the noise standard deviation is inflated to 1.8.
-        3. **Type B:** two novel clusters with labels 3 and 4, which the classifier has never seen: one at the origin (all three classes equally near) and one on the boundary between two known classes.
-
-        By construction every Type B prediction is wrong, so the risk of any selector on Type B rows alone is 1 at every coverage. That case carries no information about the ranking; it only pins down the arithmetic of the AURC integral.
-        """),
-
-        code("""
-        # S4b.1: K=3 toy with Type A (in-dist), Type C (noise x1.8) and Type B (novel labels 3, 4). n_train=300, A=900, C=900, B=600. Seed RNG_SEED+410.
-        from sklearn.metrics import roc_auc_score
-        s_rng4b = np.random.default_rng(RNG_SEED + 410)
-        s_ang4b = np.array([0.0, 2 * np.pi / 3, 4 * np.pi / 3])
-        s_cen4b = 2.0 * np.column_stack([np.cos(s_ang4b), np.sin(s_ang4b)])
-
-        def s_known4b(n, sd):
-            y = s_rng4b.integers(0, 3, n)
-            return s_cen4b[y] + sd * s_rng4b.standard_normal((n, 2)), y
-
-        s_Xtr4b, s_ytr4b = s_known4b(300, 1.0)
-        s_XA, s_yA = s_known4b(900, 1.0)
-        s_XC, s_yC = s_known4b(900, 1.8)
-        s_nov_centres = np.array([[0.0, 0.0], [1.5, 2.6]])
-        s_yB = s_rng4b.integers(3, 5, 600)
-        s_XB = s_nov_centres[s_yB - 3] + 0.8 * s_rng4b.standard_normal((600, 2))
-
-        s_clf4b = LogisticRegression(C=1.0, max_iter=5000).fit(s_Xtr4b, s_ytr4b)
-        s_Z4b = {k: s_clf4b.decision_function(X) for k, X in [("A", s_XA), ("C", s_XC), ("B", s_XB)]}
-        s_pred4b = {k: s_clf4b.predict(X) for k, X in [("A", s_XA), ("C", s_XC), ("B", s_XB)]}
-        s_y4b = {"A": s_yA, "C": s_yC, "B": s_yB}
-        s_cor4b = {k: s_pred4b[k] == s_y4b[k] for k in s_Z4b}
-
-        check("S4b.1a", set(np.unique(s_yB)) == {3, 4} and not set(np.unique(s_ytr4b)) & {3, 4} and list(s_clf4b.classes_) == [0, 1, 2],
-              f"Type B labels {sorted(int(v) for v in np.unique(s_yB))} are absent from the training labels {[int(v) for v in s_clf4b.classes_]}")
-        check("S4b.1b", not s_cor4b["B"].any(),
-              f"every Type B prediction is wrong (novel label): error rate {1 - s_cor4b['B'].mean():.3f}")
-        print(f"Type A error {1 - s_cor4b['A'].mean():.3f}, Type C error {1 - s_cor4b['C'].mean():.3f}, Type B error {1 - s_cor4b['B'].mean():.3f}")
-        print(f"Rows: A={len(s_yA)}, C={len(s_yC)}, B={len(s_yB)}; training rows are independent draws, so no test row was used for fitting.")
-        """),
-
-        code("""
-        # S4b.2: Scores computed from logits. SR_max, SR_doctor, SR_ent (Eq. 7), conf-M margin, RL_max, Energy.
-        def s_scores4b(z):
-            zs = -np.sort(-z, axis=1)
-            p = s_softmax4(z)
-            return {"SR_max": p.max(axis=1), "SR_doctor": 1.0 - 1.0 / (p ** 2).sum(axis=1), "SR_ent": (p * np.log(np.clip(p, 1e-300, 1))).sum(axis=1),
-                    "margin": zs[:, 0] - zs[:, 1], "RL_max": zs[:, 0], "Energy": logsumexp(z, axis=1)}
-
-        s_S4b = {k: s_scores4b(Z) for k, Z in s_Z4b.items()}
-        s_names4b = list(s_S4b["A"].keys())
-
-        # Regime-by-regime AURC for two scores (SR_max and margin).
-        s_reg_aurc = {}
-        for s_k in ["A", "C", "B"]:
-            for s_nm in ["SR_max", "margin"]:
-                s_reg_aurc[(s_k, s_nm)] = s_aurc_of(s_S4b[s_k][s_nm], s_cor4b[s_k])
-
-        print("AURC by regime (rows of one type only):")
-        for s_k, s_lab in [("A", "Type A"), ("C", "Type C"), ("B", "Type B")]:
-            print(f"  {s_lab}: SR_max {s_reg_aurc[(s_k, 'SR_max')]:.4f}   margin {s_reg_aurc[(s_k, 'margin')]:.4f}   base error {1 - s_cor4b[s_k].mean():.4f}")
-
-        s_nB = len(s_yB)
-        check("S4b.2a", all(abs(s_reg_aurc[("B", nm)] - (1 - 1 / s_nB)) < 1e-12 for nm in ["SR_max", "margin"]),
-              f"Type B AURC = 1 - 1/n = {1 - 1 / s_nB:.6f} exactly for both scores: risk is 1 at every coverage and the trapezoid starts at coverage 1/n")
-        check("S4b.2b", all(s_reg_aurc[("C", nm)] > s_reg_aurc[("A", nm)] for nm in ["SR_max", "margin"]),
-              f"covariate shift raises AURC for both scores: A {s_reg_aurc[('A', 'SR_max')]:.4f} -> C {s_reg_aurc[('C', 'SR_max')]:.4f} (SR_max), "
-              f"A {s_reg_aurc[('A', 'margin')]:.4f} -> C {s_reg_aurc[('C', 'margin')]:.4f} (margin)")
-        """),
-
-        code("""
-        # S4b.3: OOD detection (known A+C vs novel B) and selective classification on known rows, for six logit-based scores.
-        # Paired bootstrap B=400 on the known rows (n=1800), seeds RNG_SEED+430..432.
-        s_zk = np.vstack([s_Z4b["A"], s_Z4b["C"]])
-        s_ck = np.hstack([s_cor4b["A"], s_cor4b["C"]])
-        s_Sk = s_scores4b(s_zk)
-        s_Sb = s_S4b["B"]
-        s_n1, s_n2 = len(s_ck), len(s_yB)
-
-        def s_hanley_se(auc, n1, n2):
-            q1, q2 = auc / (2 - auc), 2 * auc ** 2 / (1 + auc)
-            return float(np.sqrt((auc * (1 - auc) + (n1 - 1) * (q1 - auc ** 2) + (n2 - 1) * (q2 - auc ** 2)) / (n1 * n2)))
-
-        s_tab4b = {}
-        print(f"{'score':10s} {'AUROC(ID vs novel)':>19s} {'AURC known-only':>16s} {'AURC pooled A+C+B':>18s}")
-        for s_nm in s_names4b:
-            s_auc = roc_auc_score(np.r_[np.ones(s_n1), np.zeros(s_n2)], np.r_[s_Sk[s_nm], s_Sb[s_nm]])
-            s_ak = s_aurc_of(s_Sk[s_nm], s_ck)
-            s_ap = s_aurc_of(np.r_[s_Sk[s_nm], s_Sb[s_nm]], np.r_[s_ck, s_cor4b["B"]])
-            s_tab4b[s_nm] = (s_auc, s_ak, s_ap)
-            print(f"{s_nm:10s} {s_auc:19.3f} {s_ak:16.4f} {s_ap:18.4f}")
-
-        check("S4b.3a", all(v[0] - 0.5 > 3 * s_hanley_se(v[0], s_n1, s_n2) for v in s_tab4b.values()),
-              "every score detects the novel rows above chance by > 3 Hanley-McNeil SE (AUROC min "
-              f"{min(v[0] for v in s_tab4b.values()):.3f}, SE about {s_hanley_se(min(v[0] for v in s_tab4b.values()), s_n1, s_n2):.3f})")
-
-        s_b_energy = s_paired_boot(s_Sk["margin"], s_Sk["Energy"], s_ck, seed=RNG_SEED + 430)
-        s_b_rlmax = s_paired_boot(s_Sk["margin"], s_Sk["RL_max"], s_ck, seed=RNG_SEED + 431)
-        s_b_srmax = s_paired_boot(s_Sk["margin"], s_Sk["SR_max"], s_ck, seed=RNG_SEED + 432)
-        check("S4b.3b", s_b_energy[2] < 0,
-              f"known-only AURC(margin) - AURC(Energy) = {s_b_energy[0]:+.4f}, paired 95% CI [{s_b_energy[1]:+.4f}, {s_b_energy[2]:+.4f}] (upper bound < 0)")
-        check("S4b.3c", s_b_rlmax[2] < 0,
-              f"known-only AURC(margin) - AURC(RL_max) = {s_b_rlmax[0]:+.4f}, paired 95% CI [{s_b_rlmax[1]:+.4f}, {s_b_rlmax[2]:+.4f}] (upper bound < 0)")
-        note("S4b.3d", f"known-only AURC(margin) - AURC(SR_max) = {s_b_srmax[0]:+.4f}, paired 95% CI [{s_b_srmax[1]:+.4f}, {s_b_srmax[2]:+.4f}]"
-             + (" (CI excludes 0)" if s_b_srmax[1] > 0 or s_b_srmax[2] < 0 else " (CI contains 0: margin and SR_max are not separable on this toy)"))
-
-        s_auc_vec = np.array([s_tab4b[n][0] for n in s_names4b])
-        s_aurc_vec = np.array([s_tab4b[n][1] for n in s_names4b])
-        s_rank_corr = float(spearmanr(s_auc_vec, -s_aurc_vec)[0])
-        note("S4b.3e", f"across the six scores, Spearman(AUROC for novel detection, -AURC on known rows) = {s_rank_corr:+.3f}; "
-             f"best novelty detector: {s_names4b[int(np.argmax(s_auc_vec))]}, best selective classifier on known rows: {s_names4b[int(np.argmin(s_aurc_vec))]}")
-        """),
-
-        # ─────────────────────────────────────────────────────────────────────────────────
-        # Plot 3: RC curves per score on known rows, and AUROC versus AURC
-        # ─────────────────────────────────────────────────────────────────────────────────
-
-        code("""
-        # S4b.4: Left: known-only RC curves for the six scores. Right: novelty-detection AUROC against known-only AURC (from S4b.3).
-        s_colours4b = dict(zip(s_names4b, ["clean", "acoustic", "mask", "frozen", "shifted", "adapted"]))
-        plt.figure(figsize=(11, 5.2))
-        plt.subplot(1, 2, 1)
-        for s_nm in s_names4b:
-            s_cov, s_risk = risk_coverage_curve(s_Sk[s_nm], s_ck)
-            plt.plot(s_cov, s_risk, label=f"{s_nm} (AURC={s_tab4b[s_nm][1]:.4f})", color=PALETTE[s_colours4b[s_nm]], linewidth=1.8,
-                     linestyle="--" if s_nm in ("RL_max", "Energy") else "-")
-        plt.axhline(1 - s_ck.mean(), color=PALETTE["reference"], linestyle=":", linewidth=1.5, label="base error (coverage 1)")
-        plt.xlabel("Coverage φ", fontsize=12)
-        plt.ylabel("Selection risk R (known rows: Type A + C)", fontsize=12)
-        plt.title("Known-label rows: six selectors", fontsize=13, fontweight="bold")
-        plt.legend(fontsize=8, loc="upper left")
-        plt.xlim(0, 1)
-
-        plt.subplot(1, 2, 2)
-        for s_nm in s_names4b:
-            plt.scatter(s_tab4b[s_nm][0], s_tab4b[s_nm][1], s=90, color=PALETTE[s_colours4b[s_nm]], zorder=3)
-            if s_nm in ("RL_max", "Energy"):
-                plt.annotate(s_nm, (s_tab4b[s_nm][0], s_tab4b[s_nm][1]), textcoords="offset points", xytext=(6, 5), fontsize=9)
-        s_grp = ["SR_max", "SR_doctor", "SR_ent", "margin"]
-        plt.annotate("SR_max, SR_doctor, SR_ent, margin (overlapping)", (np.mean([s_tab4b[n][0] for n in s_grp]), np.mean([s_tab4b[n][1] for n in s_grp])),
-                     textcoords="offset points", xytext=(-150, 25), fontsize=9, arrowprops={"arrowstyle": "-", "color": PALETTE["reference"]})
-        plt.xlabel("AUROC: known vs novel rows (higher = better novelty detector)", fontsize=11)
-        plt.ylabel("AURC on known rows (lower = better selector)", fontsize=11)
-        plt.title("Novelty detection vs selection", fontsize=13, fontweight="bold")
-        plt.tight_layout()
-        plt.show()
-
-        s_pooled_best = s_names4b[int(np.argmin([s_tab4b[n][2] for n in s_names4b]))]
-        print(f"Best pooled-AURC score when Type B rows are mixed in: {s_pooled_best}; best on known rows only: {s_names4b[int(np.argmin(s_aurc_vec))]}.")
-        """),
-
-        md("""
-        ### How to read this chart
-
-        Both panels use only the two kinds of rows that share the classifier's label set (Type A and Type C pooled), which is the setting of Eq. (8) in the paper, except in the right panel where the novelty-detection axis uses the Type B rows as well.
-
-        **Left panel (RC curves).** The x-axis is coverage and the y-axis is the error rate among retained rows. Each line is one score; the SR family and the margin are solid, and the two OOD-style scores (RL_max and Energy) are dashed. The dotted horizontal line is the error rate at full coverage, where every selector must end. A line that stays lower at a given coverage keeps more errors out of the retained set; lines that nearly overlap are scores that rank the rows almost identically; the printed AURCs and the paired intervals say whether any visible gap is larger than resampling noise.
-
-        **Right panel (novelty detection versus selection).** Each point is one score. The x-axis measures how well the score separates known rows from novel rows (further right is better at spotting novelty); the y-axis is the AURC on known rows (lower is a better selective classifier). If good novelty detectors were poor selectors, the points would slope upward to the right. If the two abilities go together, they slope downward.
-
-        **Takeaway.** The printed checks decide what this toy supports, not the eye. The paired-bootstrap intervals on AURC differences are the evidence about RL_max and Energy versus the margin; the printed rank correlation summarizes the right panel. Anything the paper says about KNN and ViM is untouched by this toy because those scores were not computed. A toy in the plane with a linear classifier is far from the deep vision and text models of the paper's experiments (L pp.10-14), so agreement or disagreement here is weak evidence either way.
-        """),
-
-        code("""
-        # S4b.5: Extension beyond Eq. (8): pool Type B rows with the known rows. What share of the retained rows is novel at coverage 0.5?
-        # Pooled set: 1800 known + 600 novel rows; random selection would retain a novel share of 600/2400. Paired bootstrap B=400, seeds RNG_SEED+440..441.
-        s_c_pool = np.r_[s_ck, s_cor4b["B"]]
-        s_is_novel = np.r_[np.zeros(s_n1, dtype=bool), np.ones(s_n2, dtype=bool)]
-        s_share0 = s_n2 / (s_n1 + s_n2)
-        s_k_half = (s_n1 + s_n2) // 2
-        s_share = {}
-        for s_nm in s_names4b:
-            s_pool_score = np.r_[s_Sk[s_nm], s_Sb[s_nm]]
-            s_top = np.argsort(-s_pool_score, kind="stable")[:s_k_half]
-            s_share[s_nm] = float(np.mean(s_is_novel[s_top]))
-        s_se_share = float(np.sqrt(s_share0 * (1 - s_share0) / s_k_half))
-
-        print(f"Share of retained rows that are Type B at coverage 0.5 (random selection: {s_share0:.3f}, binomial SE {s_se_share:.3f}):")
-        for s_nm in s_names4b:
-            print(f"  {s_nm:10s} {s_share[s_nm]:.3f}")
-
-        check("S4b.5a", all(v < s_share0 - 3 * s_se_share for v in s_share.values()),
-              f"every score retains fewer novel rows than random selection by more than 3 SE (largest share {max(s_share.values()):.3f} < {s_share0 - 3 * s_se_share:.3f})")
-
-        s_pool = {nm: np.r_[s_Sk[nm], s_Sb[nm]] for nm in s_names4b}
-        s_p_energy = s_paired_boot(s_pool["margin"], s_pool["Energy"], s_c_pool, seed=RNG_SEED + 440)
-        s_p_srmax = s_paired_boot(s_pool["margin"], s_pool["SR_max"], s_c_pool, seed=RNG_SEED + 441)
-        check("S4b.5b", s_p_energy[2] < 0,
-              f"pooled AURC(margin) - AURC(Energy) = {s_p_energy[0]:+.4f}, paired 95% CI [{s_p_energy[1]:+.4f}, {s_p_energy[2]:+.4f}] (upper bound < 0)")
-        note("S4b.5c", f"pooled AURC(margin) - AURC(SR_max) = {s_p_srmax[0]:+.4f}, paired 95% CI [{s_p_srmax[1]:+.4f}, {s_p_srmax[2]:+.4f}]"
-             + (" (CI excludes 0)" if s_p_srmax[1] > 0 or s_p_srmax[2] < 0 else " (CI contains 0)"))
-        """),
-
-        code("""
-        # S4b.6: Does covariate shift degrade selection? Unpaired bootstrap (B=400) of AURC(Type C) - AURC(Type A) per score, seed RNG_SEED+501.
-        def s_unpaired_boot(score_a, cor_a, score_b, cor_b, B=400, seed=0):
-            rng = np.random.default_rng(seed)
-            diffs = np.empty(B)
-            for b in range(B):
-                ia = rng.integers(0, len(cor_a), len(cor_a))
-                ib = rng.integers(0, len(cor_b), len(cor_b))
-                diffs[b] = s_aurc_of(score_a[ia], cor_a[ia]) - s_aurc_of(score_b[ib], cor_b[ib])
-            lo, hi = np.quantile(diffs, [0.025, 0.975])
-            return s_aurc_of(score_a, cor_a) - s_aurc_of(score_b, cor_b), float(lo), float(hi)
-
-        s_shift_ci = {}
-        for s_i, s_nm in enumerate(["SR_max", "margin"]):
-            s_shift_ci[s_nm] = s_unpaired_boot(s_S4b["C"][s_nm], s_cor4b["C"], s_S4b["A"][s_nm], s_cor4b["A"], seed=RNG_SEED + 501 + s_i)
-            print(f"AURC(C) - AURC(A) for {s_nm}: {s_shift_ci[s_nm][0]:+.4f}, 95% CI [{s_shift_ci[s_nm][1]:+.4f}, {s_shift_ci[s_nm][2]:+.4f}]")
-
-        s_err_a = np.r_[(~s_cor4b["A"]).astype(float)]
-        s_err_c = np.r_[(~s_cor4b["C"]).astype(float)]
-        s_rng_err = np.random.default_rng(RNG_SEED + 503)
-        s_err_diff = np.array([np.mean(s_err_c[s_rng_err.integers(0, len(s_err_c), len(s_err_c))]) - np.mean(s_err_a[s_rng_err.integers(0, len(s_err_a), len(s_err_a))]) for _ in range(1000)])
-        s_err_lo, s_err_hi = np.quantile(s_err_diff, [0.025, 0.975])
-        print(f"Error rate (C) - (A): {s_err_c.mean() - s_err_a.mean():+.4f}, 95% CI [{s_err_lo:+.4f}, {s_err_hi:+.4f}]")
-
-        check("S4b.6a", s_err_lo > 0, f"covariate shift raises the error rate: CI lower bound {s_err_lo:+.4f} > 0")
-        check("S4b.6b", all(v[1] > 0 for v in s_shift_ci.values()),
-              "covariate shift raises AURC for both scores: lower CI bounds " + ", ".join(f"{k} {v[1]:+.4f}" for k, v in s_shift_ci.items()) + " (> 0)")
-        """),
-
-        code("""
-        # S4b.7: Operating point view (Eq. 3 read backwards): largest coverage whose selection risk is at most 10% on the known rows (Type A + C).
-        s_target_risk = 0.10
-        s_cov_at_target = {}
-        for s_nm in s_names4b:
-            s_cov, s_risk = risk_coverage_curve(s_Sk[s_nm], s_ck)
-            s_ok_idx = np.where(s_risk <= s_target_risk)[0]
-            s_cov_at_target[s_nm] = float(s_cov[s_ok_idx[-1]]) if len(s_ok_idx) else 0.0
-        print(f"Largest coverage with selection risk <= {s_target_risk:.2f} on known rows (base error {1 - s_ck.mean():.3f}):")
-        for s_nm in s_names4b:
-            print(f"  {s_nm:10s} coverage {s_cov_at_target[s_nm]:.3f}")
-        check("S4b.7", all(v > 0 for v in s_cov_at_target.values()) and max(s_cov_at_target.values()) < 1.0,
-              "every score reaches the risk target at a positive coverage, and none reaches it at full coverage (target below the base error)")
-        note("S4b.7n", "this is an in-sample operating point on the test rows themselves; choosing a threshold on separate calibration rows is the "
-             "calibration-set question the paper leaves open (L p.6), and is not attempted here")
-        """),
-
-        # ─────────────────────────────────────────────────────────────────────────────────
-        # Conclusion: What the paper does NOT settle
-        # ─────────────────────────────────────────────────────────────────────────────────
-
-        md("""
-        ## Conclusion: what the paper leaves open (source: Liang et al., TMLR 2024; L)
-
-        **Paraphrase of Liang et al. Sec. 2.5; L p.6.** The paper states that it does not treat how the calibration set is constructed or how the threshold $\\gamma$ is chosen, and instead evaluates the scores directly on test sets.
-
-        This notebook covered selective classification as a framework (Eqs. 1-3 and 8), the RC curve and its AURC summary, the scale sensitivity of SR scores against the scale invariance of margin scores, and a small toy comparison under covariate shift and novel labels. Every numeric statement about the toys comes from the printed output of the checks above, not from this text.
-
-        The paper's own evidence is in its experiments on ImageNet-based benchmarks, iWildCam (images), Amazon (text) and CIFAR (L pp.10-14). None of it is on audio. What remains open for a speech-commands study:
-
-        1. **Calibration-set construction.** Algorithm 1 (L p.4) picks $\\gamma$ from a small i.i.d. calibration set, and the paper leaves the construction of that set outside its scope. For speech this includes how many utterances are needed, whether the set should include shifted conditions, and whether it should be drawn per speaker or globally. These are open design questions, not results.
-        2. **Threshold selection under shift.** A threshold chosen for a coverage or risk target on clean calibration data need not deliver that target on shifted test data. Nothing in the material read for this study establishes how far coverage or risk drift; that must be measured on speech data.
-        3. **Audio evidence.** The transfer of the paper's finding that margin scores are competitive with, or better than, SR scores to acoustic shift is a hypothesis of this study. The toy above is consistent with the paper's direction for the two OOD-style scores that were run, on data with no relation to speech.
-        4. **Guarantees.** The extract of the paper used here records definitions, an evaluation protocol and empirical comparisons; it records no coverage guarantee and no finite-sample bound. Whether the appendices contain one was not checked, so no statement about guarantees is made either way.
-        5. **Novel-label inputs.** Eq. (8) assumes no outliers, so Type B inputs sit outside the formal setting. The toy pooled them anyway; the printed pooled AURCs show how the ranking of scores behaves in that extension, which is a derived-here observation and not a claim about the paper.
-
-        **Next steps for this study:** compute the confidence-margin score and the SR scores from the speech-command model's logits under each acoustic shift, compare their AURC with a paired bootstrap on shared utterances as done above, and treat threshold selection as its own experiment.
-        """),
-
-        code("""
-        # S5.1: Summary of checks run in this part.
-        check_summary()
-
-        print("=" * 70)
-        print("Part 2 complete: selective classification and scale sensitivity")
-        print("=" * 70)
-        print("Sections: 3 (RC curve, AURC, oracle closed form), 4 (SR vs margin, Lemma 3.1 grid, temperature), 4b (Types A/B/C, six scores)")
-        print("Figures: RC curves for random/imperfect/oracle scores; AURC and rank disagreement versus scale; six selectors and novelty detection")
-        print(f"Toy 4 test set: n={len(s_correct4)}, error {np.mean(~s_correct4):.3f}, fitted T={s_T4:.3f}")
-        print(f"Toy 4b known-only AURC, best score: {s_names4b[int(np.argmin(s_aurc_vec))]}; best novelty detector: {s_names4b[int(np.argmax(s_auc_vec))]}")
-        print("=" * 70)
+        **Source.** `runtime/metrics/arch-*.probes.npz`, produced by notebook 04: the stored `intra_2d` series it
+        plots as V4, and `coords_2d`, the projected probe features it computed them from.
+
+        **What it shows.** The dashed black line is a within-class scatter recomputed here directly from the stored
+        coordinates -- the $\Sigma_W$ trace of section 4.2, in the projected plane. It lies on the coloured stored
+        series. That is the evidence for the first row of the table above: notebook 04's V4 is the same quantity the
+        neural-collapse literature calls within-class variability, measured in 2D on held-out probes.
+
+        **What would falsify the reading.** If the dashed and solid lines diverged, the claim that V4 and
+        $\mathrm{NC}_1$ are the same family would be wrong, and section 4.5's parallels with it. The per-arm
+        Spearman correlation in the table above is the check: it must exceed $0.9$.
+
+        **What it does not show.** Panel titles carry each arm's TPT status. `timepool` never reached near-zero
+        training error, so the neural-collapse reading does not apply to it at all -- its curve is geometry, not
+        collapse. And nothing here speaks to MM-PHATE.
         """),
     ]

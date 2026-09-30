@@ -1,708 +1,499 @@
-"""Notebook part 4: acoustic shift operators, a noise-injected mixup toy, and synthesis.
+"""NB1 part 4: section 7 (salvaged derivations, re-verified) and section 8 (limitations and claim ledger).
 
-Sections 8, 9, 10: measured shifts (gain, additive noise, synthetic-RIR reverb), a NoisyMix-style toy
-analogue, and the recap of what the sources do and do not settle.
+Constructed inputs here are estimator-verification fixtures (uniform scores, constructed logits): they test
+formulas and estimators, and are never presented as evidence about speech models. The one real-data cell reads
+the conformal outputs stored in arch-*.result.json.
 """
-
 from nbkit import md, code
 
 
 def cells():
     return [
         md(r"""
-## 8. Acoustic shift operators with measured severity (derived here)
+        ## 7. Salvaged derivations: scoring rules, ECE bias, temperature-scaling MLE, conformal risk control
 
-This section operationalises three canonical acoustic perturbations for a fixed-vocabulary speech-command setting: gain change, additive white noise, and reverberation. Each operator is driven by one requested severity (gain in dB, signal-to-noise ratio in dB, reverberation time $T_{60}$ together with a direct-to-reverberant ratio). The point of the section is not to *use* the operators but to **measure whether the severity actually delivered matches the severity requested**, because every later claim of the form "accuracy at 10 dB SNR" or "calibration at $T_{60}=0.6$ s" silently assumes it does.
+        This section keeps the mathematics of the earlier foundations notebook that was worth keeping and drops its
+        synthetic-data framing. Each derivation is followed by a numerical check against either an independent
+        implementation or the project's own `src` functions. The constructed inputs are **estimator-verification
+        fixtures**: they test that a formula or an estimator does what its derivation says. They are not evidence
+        about speech models and are labelled as fixtures at each cell.
 
-**Why this matters for the sources.** The paragraphs below are paper-level statements, each restricted to what the raw traces contain.
+        ### 7.1 Proper scoring rules: NLL and Brier
 
-- Conformal risk control (Angelopoulos et al., 2208.02814) guarantees expected risk only for exchangeable data. Section 5 of the paper, as quoted in q12, says extensions to non-exchangeable data require knowledge about the form of the shift. A clean-calibrated model deployed on noisy or reverberant audio is exactly that situation (q8, "Failure of Standard Risk Control under Shift").
-- q8 lists two transferable hypotheses for acoustic shift: a weighted risk-control threshold if the shift can be modelled as covariate shift with an estimable density ratio, and a total-variation bound for shifts that cannot. Both are labelled hypotheses in q8; neither is tested on audio in this notebook.
-- NoisyMix (Erichson et al., AISTATS 2024) states in its conclusion: *"A limitation of NoisyMix is that it is tailored towards computer vision tasks and not directly applicable to natural language processing tasks, or time series tasks."* (q6, q7, q8, q12). Any audio analogue therefore needs audio-native perturbations, which is why we build and validate the operators here.
-
-**What is derived here, not taken from a paper.** The synthetic waveform, the SNR algebra, the clipping emulation, and the verification of the room-impulse-response (RIR) reverb are all our own constructions. Nothing in this section is a claim about real speech.
-
-**Conventions.** Signal power is $P_s=\frac1N\sum_t s_t^2$ (a *power*, not an RMS amplitude). All ratios in dB are $10\log_{10}$ of a power ratio, or equivalently $20\log_{10}$ of an amplitude ratio. Every number that comes from a run is printed by a code cell; the prose only states what to look for.
+        For a $K$-class prediction $p\in\Delta^{K-1}$ and a label $y$, the logarithmic score (NLL) and the multiclass
+        Brier score are
+        $$\ell_{\log}(p,y)=-\log p_y,\qquad \ell_{\mathrm{Br}}(p,y)=\lVert p-e_y\rVert_2^2=\sum_{j}(p_j-\mathbb{1}\{j=y\})^2 .$$
+        Suppose the label is drawn from a true distribution $q$. Then the expected scores decompose as
+        $$\mathbb{E}_{y\sim q}\,\ell_{\log}(p,y)=H(q)+\mathrm{KL}(q\,\Vert\,p),$$
+        $$\mathbb{E}_{y\sim q}\,\ell_{\mathrm{Br}}(p,y)=\lVert p-q\rVert_2^2+\big(1-\lVert q\rVert_2^2\big).$$
+        The first is the usual entropy-plus-KL identity: $\sum_y q_y(-\log p_y)=-\sum_y q_y\log q_y+\sum_y q_y\log(q_y/p_y)$.
+        For the second, $\mathbb{E}\lVert p-e_y\rVert^2=\lVert p\rVert^2-2p^\top q+1=\lVert p-q\rVert^2+1-\lVert q\rVert^2$.
+        In both, the second term does not depend on $p$ and the first is non-negative and zero only at $p=q$:
+        both rules are **strictly proper**, minimised in expectation by reporting the truth. A uniform predictor scores
+        $\ln K$ (NLL) and $1-1/K$ (Brier); the Brier score lies in $[0,2]$ while NLL is unbounded above, which is why a
+        single confidently wrong prediction dominates NLL and only bounds Brier.
         """),
 
         code(r"""
-# S8.0 setup: synthetic 1 s speech-like waveform (4 harmonics + fricative burst), fs=16 kHz, n=16000 samples, seed RNG_SEED+8, reps=1
-import sys; sys.path.insert(0, str(ROOT))
-from src import audio
-
-n_sr = 16000
-n_duration = 1.0
-n_samples = int(n_sr * n_duration)
-n_rng = np.random.default_rng(RNG_SEED + 8)
-n_time = np.arange(n_samples, dtype=np.float32) / n_sr
-
-# amplitude envelope: 50 ms ramp-in, 700 ms plateau, exponential release
-n_attack, n_sustain = int(0.05 * n_sr), int(0.7 * n_sr)
-n_release = n_samples - n_attack - n_sustain
-n_env = np.ones(n_samples, dtype=np.float32)
-n_env[:n_attack] = np.linspace(0, 1, n_attack)
-n_env[n_attack + n_sustain:] = np.exp(-np.linspace(0, 4, n_release))
-
-# harmonic part: 110 Hz fundamental, partials 2,3,5,8 (all below 1 kHz)
-n_overtones = np.array([2, 3, 5, 8])
-n_harmonic = np.zeros(n_samples, dtype=np.float32)
-for n_ratio in n_overtones:
-    n_harmonic += np.sin(2 * np.pi * 110.0 * n_ratio * n_time).astype(np.float32) / len(n_overtones)
-n_harmonic *= n_env
-
-# broadband burst 0.30-0.40 s (stand-in for a fricative); zero outside that window
-n_burst_start, n_burst_len = int(0.3 * n_sr), int(0.1 * n_sr)
-n_fric = np.zeros(n_samples, dtype=np.float32)
-n_fric[n_burst_start:n_burst_start + n_burst_len] = 0.3 * n_rng.standard_normal(n_burst_len).astype(np.float32)
-n_fric *= n_env
-
-n_waveform = (n_harmonic + n_fric).astype(np.float32)
-n_waveform = n_waveform / (np.abs(n_waveform).max() + 1e-8)          # peak-normalise to full scale
-n_sig_pow = float(np.mean(n_waveform.astype(np.float64) ** 2))       # power, used by every SNR formula below
-n_burst_end = n_burst_start + n_burst_len
-
-print(f"[S8.0] waveform {n_waveform.shape}, power P_s={n_sig_pow:.4f}, RMS={np.sqrt(n_sig_pow):.4f}, peak={np.abs(n_waveform).max():.6f}")
-check("S8.0", n_waveform.shape == (n_samples,) and np.isfinite(n_waveform).all() and abs(np.abs(n_waveform).max() - 1.0) < 1e-6
-      and not n_fric[:n_burst_start].any() and not n_fric[n_burst_end:].any() and n_fric[n_burst_start:n_burst_end].any(),
-      f"shape/finite/peak=1, and the broadband burst is confined to samples [{n_burst_start},{n_burst_end})")
+        # N1.7.1: expected NLL and Brier on the 3-class simplex (FIXTURE q = (0.5, 0.3, 0.2)); identities; agreement with src.metrics.
+        from src.metrics import nll as src_nll, brier_score as src_brier
+        q3 = np.array([0.5, 0.3, 0.2]); m_ = 60
+        P3 = np.array([(i / m_, j / m_, (m_ - i - j) / m_) for i in range(m_ + 1) for j in range(m_ + 1 - i)])
+        P3c = np.clip(P3, 1e-12, 1.0)
+        e_nll = -(q3 * np.log(P3c)).sum(1)
+        e_br = (P3 ** 2).sum(1) - 2 * (P3 @ q3) + 1
+        Hq = -(q3 * np.log(q3)).sum(); KL = (q3 * np.log(q3 / P3c)).sum(1)
+        check("N1.7.1a", np.allclose(e_nll, Hq + KL), "E[NLL] = H(q) + KL(q||p) on all simplex grid points")
+        check("N1.7.1b", np.allclose(e_br, ((P3 - q3) ** 2).sum(1) + 1 - (q3 ** 2).sum()), "E[Brier] = ||p - q||^2 + 1 - ||q||^2 on all grid points")
+        i_n, i_b = int(np.argmin(e_nll)), int(np.argmin(e_br))
+        check("N1.7.1c", np.allclose(P3[i_n], q3) and np.allclose(P3[i_b], q3), f"both expected scores are minimised at p = q (argmins {P3[i_n]}, {P3[i_b]})")
+        rngs = np.random.default_rng(RNG_SEED + 71)
+        Kp, np_ = 5, 800
+        logits_ = rngs.standard_normal((np_, Kp)) * 2; pr_ = np.exp(logits_) / np.exp(logits_).sum(1, keepdims=True); yl_ = rngs.integers(0, Kp, np_)
+        own_nll = float(-np.log(pr_[np.arange(np_), yl_]).mean()); own_br = float(((pr_ - np.eye(Kp)[yl_]) ** 2).sum(1).mean())
+        check("N1.7.1d", abs(own_nll - src_nll(pr_, yl_)) < 1e-12 and abs(own_br - src_brier(pr_, yl_)) < 1e-12, "own NLL and Brier equal src.metrics.nll / brier_score")
+        uni = np.full((10, Kp), 1 / Kp)
+        check("N1.7.1e", abs(src_nll(uni, np.arange(10) % Kp) - np.log(Kp)) < 1e-12 and abs(src_brier(uni, np.arange(10) % Kp) - (1 - 1 / Kp)) < 1e-12, f"uniform predictor: NLL = ln K = {np.log(Kp):.4f}, Brier = 1 - 1/K = {1 - 1 / Kp:.2f}")
+        bx = 0.5 * (2 * P3[:, 1] + P3[:, 2]); by = (np.sqrt(3) / 2) * P3[:, 2]
+        fig, axs = plt.subplots(1, 2, figsize=(11.5, 4.6))
+        for ax, val, ttl in zip(axs, [e_nll, e_br], ["expected NLL   H(q) + KL(q||p)", "expected Brier   ||p-q||^2 + const"]):
+            tc = ax.tricontourf(bx, by, val, levels=14, cmap="viridis")
+            ax.plot(*[0.5 * (2 * q3[1] + q3[2]), (np.sqrt(3) / 2) * q3[2]], marker="*", ms=16, color="w", mec="k"); ax.set_aspect("equal"); ax.set_axis_off()
+            ax.set_title(ttl, fontsize=10); fig.colorbar(tc, ax=ax, shrink=0.75)
+        varied("N1.7.f1", e_nll, e_br)
+        plt.tight_layout(); savefig(fig, "fig7_1_scoring_rules.png")
         """),
 
         md(r"""
-### Gain operator and an emulated full-scale limiter
+        ### How to read this chart
 
-A gain of $g$ dB multiplies the waveform by $a=10^{g/20}$, so power scales by $a^2=10^{g/10}$. The operator `src.audio.apply_gain` performs exactly this multiplication in 32-bit float and **does not clip**: the output can exceed $\pm1$. A real microphone chain or a fixed-point file does clip at full scale, so to study that failure we emulate a hard limiter $x_c=\mathrm{clip}(a\,x,-1,1)$ as a separate, explicit step in the notebook.
+        Each panel is the probability simplex for $K=3$ (a triangle whose corners are the one-hot predictions),
+        coloured by the *expected* score of reporting the prediction at that point when the true label distribution is
+        $q=(0.5,0.3,0.2)$, marked by the white star. Both surfaces are bowl-shaped with their minimum at the star,
+        which is what "strictly proper" means: no other report scores better in expectation. The NLL surface rises
+        steeply towards the edges and corners (it is unbounded there), while the Brier surface is a bounded
+        quadratic bowl; that is the practical difference between the two rules. What would make the reading wrong:
+        a minimum anywhere except the star. The fixture $q$ is chosen for legibility and has no connection with the
+        speech data.
 
-Because our synthetic waveform is peak-normalised to full scale, *any* positive gain pushes the peak beyond $\pm1$; whether that matters depends on how many samples exceed full scale and how much distortion power $D=\frac1N\sum_t (x_{c,t}-a x_t)^2$ the limiter injects. The signal-to-distortion ratio $\mathrm{SDR}=10\log_{10}(P_{ax}/D)$ measures how badly the clipped waveform departs from the ideal scaled waveform.
+        ### 7.2 ECE: finite-sample bias and its dependence on the number of bins
 
-We check two things: that the operator delivers the requested scale to float32 precision, and that the number of samples above full scale follows from the waveform's own amplitude distribution ($|x_t|>10^{-g/20}$) and is monotone in $g$.
+        Write $\mathrm{conf}_i$ for the top-label probability and $c_i=\mathbb{1}\{\hat y_i=y_i\}$ for correctness. The
+        binned estimator has the exact identity
+        $$\widehat{\mathrm{ECE}}_B=\sum_{b=1}^B\frac{|S_b|}{n}\big|\bar c_b-\overline{\mathrm{conf}}_b\big|=\frac1n\sum_{b=1}^B\Big|\sum_{i\in S_b}\big(c_i-\mathrm{conf}_i\big)\Big| .$$
+        For a **perfectly calibrated** model, $c_i\sim\mathrm{Bernoulli}(\mathrm{conf}_i)$, so each inner sum has mean
+        zero and variance $\sum_{i\in S_b}\mathrm{conf}_i(1-\mathrm{conf}_i)\approx n_b\,v_b$ with $v_b$ the mean of
+        $\mathrm{conf}(1-\mathrm{conf})$ in the bin. Its absolute value is approximately half-normal, with mean
+        $\sqrt{2/\pi}\sqrt{n_bv_b}$, hence
+        $$\mathbb{E}\,\widehat{\mathrm{ECE}}_B\ \approx\ \sqrt{\tfrac{2}{\pi}}\ \frac{1}{n}\sum_{b}\sqrt{n_b\,v_b}\ \asymp\ \sqrt{\frac{B_{\mathrm{eff}}}{n}},$$
+        where $B_{\mathrm{eff}}$ is the number of occupied bins. Two consequences: the estimator is **positive even
+        for a perfect model** (bias of order $\sqrt{B/n}$), and it **grows with $\sqrt B$**, which is the mechanism
+        behind the bin-count dependence seen in Section 6. For confidences spread uniformly over $[0.5,1]$, $n=1080$ and $B=15$ the bias is about $0.027$; it is smaller when
+        confidences pile up near $1$, where $\mathrm{conf}(1-\mathrm{conf})$ is small, so this is an upper-end reference for
+        our arms' clean ECE values ($0.026$ to $0.065$), not a measurement of their floor.
         """),
 
         code(r"""
-# S8.1 gain + emulated clipping: g in {-6, 0, +3, +12} dB on the peak-normalised waveform; deterministic (no random draws), n=16000
-n_gains_db = [-6.0, 0.0, 3.0, 12.0]
-n_gain = {}
-n_x64 = n_waveform.astype(np.float64)
-for n_g in n_gains_db:
-    n_out, _ = audio.apply_gain(n_waveform, gain_db=n_g)               # float32, unclipped
-    n_clipped = np.clip(n_out, -1.0, 1.0)                              # emulated hard limiter at full scale
-    n_over = int(np.sum(np.abs(n_out) > 1.0))
-    n_over_expected = int(np.sum(np.abs(n_x64) > 10.0 ** (-n_g / 20.0)))  # from the original amplitudes only
-    n_dist = float(np.mean((n_clipped.astype(np.float64) - n_out.astype(np.float64)) ** 2))
-    n_pow = float(np.mean(n_out.astype(np.float64) ** 2))
-    n_scale_err = abs(np.sqrt(n_pow / n_sig_pow) / 10.0 ** (n_g / 20.0) - 1.0)
-    n_gain[n_g] = dict(out=n_out, clip=n_clipped, over=n_over, over_expected=n_over_expected, dist=n_dist, power=n_pow, scale_err=n_scale_err)
-    n_sdr = 10 * np.log10(n_pow / n_dist) if n_dist > 0 else float("inf")
-    print(f"gain {n_g:+5.1f} dB: RMS ratio error {n_scale_err:.2e}, samples over full scale {n_over} (expected {n_over_expected}), "
-          f"clip distortion power D={n_dist:.2e}, SDR={n_sdr:.2f} dB")
-
-check("S8.1", max(v["scale_err"] for v in n_gain.values()) < 1e-5,
-      f"apply_gain RMS ratio matches 10^(g/20): worst relative error {max(v['scale_err'] for v in n_gain.values()):.2e} < 1e-5 (float32 rounding)")
-n_counts = [n_gain[g]["over"] for g in n_gains_db]
-check("S8.2", n_counts[0] == 0 and n_counts[1] == 0 and n_counts[2] > 0 and n_counts == sorted(n_counts)
-      and all(n_gain[g]["over"] == n_gain[g]["over_expected"] for g in n_gains_db),
-      f"over-full-scale counts {n_counts} are monotone in gain, zero for g<=0, and equal the count implied by |x|>10^(-g/20)")
+        # N1.7.2: Monte-Carlo ECE of a PERFECTLY calibrated model (FIXTURE: conf ~ U(0.5,1), correct ~ Bernoulli(conf)) vs the half-normal prediction.
+        from src.metrics import expected_calibration_error as src_ece
+        def ece_batch(conf, corr, B):
+            idx = np.minimum((conf * B).astype(int), B - 1); tot = np.zeros(conf.shape[0])
+            for b in range(B):
+                m = idx == b
+                tot += np.abs(((corr - conf) * m).sum(1))
+            return tot / conf.shape[1]
+        def ece_theory(n, B, lo=0.5):
+            edges = np.linspace(0, 1, B + 1); tot = 0.0
+            for b in range(B):
+                a_, c_ = max(edges[b], lo), edges[b + 1]
+                if c_ <= a_: continue
+                nb = n * (c_ - a_) / (1 - lo); mid = 0.5 * (a_ + c_); v = mid * (1 - mid)
+                tot += np.sqrt(nb * v)
+            return np.sqrt(2 / np.pi) * tot / n
+        NS = np.array([100, 300, 1000, 3000, 10000]); BS = [10, 15, 20]; R = 120
+        rngE = np.random.default_rng(RNG_SEED + 72)
+        MCE = {}
+        for B in BS:
+            for n in NS:
+                conf = rngE.uniform(0.5, 1.0, (R, n)); corr = (rngE.uniform(size=(R, n)) < conf).astype(float)
+                v = ece_batch(conf, corr, B); MCE[(B, n)] = (v.mean(), v.std(ddof=1) / np.sqrt(R))
+        conf1 = rngE.uniform(0.5, 1.0, (1, 400)); corr1 = (rngE.uniform(size=(1, 400)) < conf1).astype(float)
+        pr2 = np.stack([conf1[0], 1 - conf1[0]], 1); lab2 = np.where(corr1[0] == 1, 0, 1)
+        check("N1.7.2a", abs(ece_batch(conf1, corr1, 15)[0] - src_ece(pr2, lab2, bins=15)) < 1e-12, "vectorised ECE equals src.metrics.expected_calibration_error on a constructed draw")
+        for B in BS:
+            print(f"B={B:2d}: " + "  ".join(f"n={n}: MC {MCE[(B, n)][0]:.4f} (theory {ece_theory(n, B):.4f})" for n in NS))
+        slopes = {B: np.polyfit(np.log(NS[2:]), np.log([MCE[(B, n)][0] for n in NS[2:]]), 1)[0] for B in BS}
+        check("N1.7.2b", all(abs(s + 0.5) < 0.08 for s in slopes.values()), f"ECE of a perfect model falls like n^(-1/2): log-log slopes {', '.join(f'B={B}: {s:.3f}' for B, s in slopes.items())}")
+        rel = [abs(MCE[(B, n)][0] / ece_theory(n, B) - 1) for B in BS for n in NS[2:]]
+        check("N1.7.2c", max(rel) < 0.15, f"half-normal prediction matches Monte Carlo within {max(rel):.1%} for n >= 1000")
+        check("N1.7.2d", MCE[(20, 1000)][0] > MCE[(10, 1000)][0], f"at n=1000 a perfect model has ECE {MCE[(10, 1000)][0]:.4f} (B=10) < {MCE[(20, 1000)][0]:.4f} (B=20): more bins, more bias")
+        note("N1.7.2e", f"with confidences uniform on [0.5, 1] (a deliberately spread fixture) the bias of a PERFECT model at n=1080, B=15 is about {ece_theory(1080, 15):.4f}; models with confidences concentrated near 1 have a smaller floor because conf(1-conf) is small there")
+        fig, ax = plt.subplots(figsize=(8.2, 4.5))
+        for B, c_ in zip(BS, ["#1f77b4", "#ff7f0e", "#2ca02c"]):
+            ax.errorbar(NS, [MCE[(B, n)][0] for n in NS], yerr=[1.96 * MCE[(B, n)][1] for n in NS], marker="o", color=c_, capsize=3, label=f"B={B} Monte Carlo")
+            ax.plot(NS, [ece_theory(n, B) for n in NS], ls="--", color=c_, lw=1)
+        ax.set_xscale("log"); ax.set_yscale("log"); ax.set_xlabel("evaluation-set size n"); ax.set_ylabel("expected ECE of a perfectly calibrated model")
+        ax.legend(fontsize=8); ax.set_title("ECE bias of a perfect model (solid: Monte Carlo, dashed: half-normal theory)")
+        varied("N1.7.f2", [MCE[k][0] for k in MCE])
+        savefig(fig, "fig7_2_ece_bias.png")
         """),
 
         md(r"""
-### Noise operator: additive white noise at a requested SNR, and how far the realised SNR may stray
+        ### How to read this chart
 
-For a signal $s$ with power $P_s=\frac1N\sum_t s_t^2$, white Gaussian noise at a requested SNR of $\rho$ dB is drawn with **variance**
+        The vertical axis is the average ECE that a model with *exactly zero* miscalibration would be measured to have,
+        as the evaluation set grows (horizontal axis, log). Solid lines with whiskers are Monte-Carlo averages
+        ($120$ repetitions, $95\%$ intervals) for three bin counts; dashed lines are the half-normal formula of
+        Section 7.2. They agree closely and fall with slope $-1/2$ on the log-log axes, and the $B=20$ line lies above
+        the $B=10$ line at every $n$. Two lessons. First, ECE measured on a few hundred to a thousand examples is
+        dominated by this noise floor unless the true miscalibration is comfortably larger, so small ECE
+        differences between models are weak evidence. Second, ECE values from different bin counts are not
+        interchangeable. The construction (uniform confidences on $[0.5,1]$) is a fixture chosen so that the answer
+        is known; it is not a model of our classifiers' confidence distributions.
 
-$$\sigma_n^2=\frac{P_s}{10^{\rho/10}},\qquad\text{equivalently noise RMS }\sigma_n=\sqrt{P_s}\;10^{-\rho/20},$$
+        ### 7.3 Temperature scaling as maximum likelihood: consistency and a variance formula
 
-and the degraded signal is $x=s+n$ with $n_t\sim\mathcal N(0,\sigma_n^2)$. The two forms are the same statement: the exponent is $\rho/10$ when we talk about power and $\rho/20$ when we talk about RMS amplitude. The **realised** SNR uses the noise actually drawn, $\hat P_n=\frac1N\sum_t n_t^2$:
-
-$$\widehat{\mathrm{SNR}}=10\log_{10}\frac{P_s}{\hat P_n}.$$
-
-**The realised SNR is random, so the tolerance must come from its sampling distribution.** Since $N\hat P_n/\sigma_n^2\sim\chi^2_N$, we have $\mathrm{Var}(\hat P_n/\sigma_n^2)=2/N$. The delta method for $g(u)=-10\log_{10}u$ at $u=1$ gives
-
-$$\mathrm{SD}(\widehat{\mathrm{SNR}})\approx\frac{10}{\ln 10}\sqrt{\frac{2}{N}}.$$
-
-Worked example: $N=16000$ gives $4.343\times\sqrt{1.25\times10^{-4}}=4.343\times0.01118\approx0.049$ dB. So a single realisation typically lands within about $0.05$ dB of the request, and $3$ standard errors is about $0.15$ dB; a fixed tolerance such as $0.5$ dB would be more than ten standard errors and could hide a genuine bias. The mean over $R$ independent noise draws has standard error $\mathrm{SD}/\sqrt R$, and we test the mean error against $3$ of *those*. We also test that the empirical spread matches the $\chi^2$ prediction, which would catch a noise generator with the wrong variance structure even if its mean were right. Because $\hat P_n/\sigma_n^2$ does not depend on the signal, the same tolerance applies to any waveform with the same number of samples $N$.
+        Section 6.1 gave $\mathrm{NLL}'(\beta)$ and $\mathrm{NLL}''(\beta)$. Newton's method on the convex,
+        one-dimensional problem is
+        $$\beta_{k+1}=\beta_k-\frac{\mathrm{NLL}'(\beta_k)}{\mathrm{NLL}''(\beta_k)},\qquad
+        \mathrm{NLL}'(\beta)=\overline{\mathbb{E}_{p(\beta)}[z]-z_y},\quad \mathrm{NLL}''(\beta)=\overline{\mathrm{Var}_{p(\beta)}(z)} .$$
+        If labels truly follow $y\mid z\sim\mathrm{softmax}(\beta_0z)$, the maximum-likelihood estimator is consistent for
+        $\beta_0$, and by the usual likelihood theory
+        $$\sqrt n\,(\hat\beta-\beta_0)\ \xrightarrow{d}\ \mathcal N\!\big(0,\ 1/\overline V\big),\qquad \overline V=\mathbb{E}\big[\mathrm{Var}_{p(\beta_0)}(z)\big],$$
+        so $\mathrm{SE}(\hat\beta)\approx 1/\sqrt{n\overline V}$: fitting a *single* temperature is a very
+        well-determined problem whenever the logits have spread. The fixture below draws logits, samples labels from a
+        known temperature $T_0=1.6$ (which is the value fitted for our `wide` arm, chosen only for familiarity), and
+        checks consistency, the variance formula, and agreement with `src.calibration.temperature_scale`.
         """),
 
         code(r"""
-# S8.3 realised vs requested SNR: targets 30/20/10/0 dB, R=200 noise seeds each, n=16000, reference = the unclipped clean waveform
-n_R_snr = 200
-n_snr_targets = [30.0, 20.0, 10.0, 0.0]
-n_se_db = (10.0 / np.log(10.0)) * np.sqrt(2.0 / n_samples)          # single-realisation SD of realised SNR (delta method)
-n_snr_real = {}
-for n_t in n_snr_targets:
-    n_vals = []
-    for n_r in range(n_R_snr):
-        n_noisy, _ = audio.add_white_noise(n_waveform, sample_rate=n_sr, snr_db=n_t, seed=RNG_SEED + 8000 + 1000 * int(n_t) + n_r)
-        n_noise = n_noisy.astype(np.float64) - n_x64
-        n_vals.append(10.0 * np.log10(n_sig_pow / np.mean(n_noise ** 2)))
-    n_snr_real[n_t] = np.array(n_vals)
-
-n_inline_vs_lib = abs(n_vals[-1] - audio.measure_snr_db(n_waveform, n_noisy))
-n_mean_ok, n_sd_ok, n_lines = [], [], []
-for n_t in n_snr_targets:
-    n_v = n_snr_real[n_t]
-    n_tol_mean = 3 * n_se_db / np.sqrt(n_R_snr)
-    n_sd_ratio = n_v.std(ddof=1) / n_se_db
-    n_tol_sd = 3 / np.sqrt(2 * (n_R_snr - 1))
-    n_mean_ok.append(abs(n_v.mean() - n_t) <= n_tol_mean)
-    n_sd_ok.append(abs(n_sd_ratio - 1) <= n_tol_sd)
-    n_lines.append(f"target {n_t:5.1f}: mean err {n_v.mean() - n_t:+.4f} dB (tol {n_tol_mean:.4f}), SD/theory {n_sd_ratio:.3f} (tol +-{n_tol_sd:.3f})")
-print("\n".join(n_lines))
-print(f"theory: single-draw SD = {n_se_db:.4f} dB; 3 SD = {3 * n_se_db:.3f} dB")
-check("S8.3", all(n_mean_ok), f"mean realised-SNR error within 3 SE of the mean for all 4 targets ({sum(n_mean_ok)}/4)")
-check("S8.4", all(n_sd_ok), f"empirical SD of realised SNR matches the chi-square prediction within 3 SE ({sum(n_sd_ok)}/4)")
-check("S8.5", n_inline_vs_lib < 1e-9, f"inline power formula equals audio.measure_snr_db: |diff|={n_inline_vs_lib:.2e} dB")
+        # N1.7.3: temperature-scaling MLE on constructed logits with known T0 = 1.6 (FIXTURE): Newton solver, consistency, variance formula.
+        from src.calibration import temperature_scale
+        def softmax_rows(z):
+            z = z - z.max(1, keepdims=True); e = np.exp(z); return e / e.sum(1, keepdims=True)
+        def newton_beta(Z, y, iters=60):
+            b = 1.0
+            for _ in range(iters):
+                p = softmax_rows(b * Z); EZ = (p * Z).sum(1); g = (EZ - Z[np.arange(len(y)), y]).mean(); h = ((p * Z ** 2).sum(1) - EZ ** 2).mean()
+                b = max(b - g / h, 1e-6)
+                if abs(g / h) < 1e-12: break
+            return b, h
+        T0, K7 = 1.6, 8
+        def draw(n, rng):
+            Z = 3.0 * rng.standard_normal((n, K7)); p = softmax_rows(Z / T0)
+            y = (p.cumsum(1) > rng.uniform(size=(n, 1))).argmax(1); return Z, y
+        rng7 = np.random.default_rng(RNG_SEED + 73)
+        NB = [200, 500, 1000, 3000, 10000]; RB = 60
+        rows = []
+        for n in NB:
+            bh, vh = [], []
+            for _ in range(RB):
+                Z, y = draw(n, rng7); b, h = newton_beta(Z, y); bh.append(b); vh.append(h)
+            bh = np.array(bh); rows.append({"n": n, "mean beta_hat": bh.mean(), "beta0": 1 / T0, "bias": bh.mean() - 1 / T0, "sd(beta_hat)": bh.std(ddof=1),
+                                             "theory 1/sqrt(n V)": 1 / np.sqrt(n * np.mean(vh)), "mean T_hat": np.mean(1 / bh)})
+        TSFIT = pd.DataFrame(rows).set_index("n")
+        display(TSFIT.round(5))
+        check("N1.7.3a", abs(TSFIT.loc[10000, "mean beta_hat"] - 1 / T0) < 3 * TSFIT.loc[10000, "sd(beta_hat)"] / np.sqrt(RB) + 1e-4, f"consistency: mean beta_hat at n=10000 = {TSFIT.loc[10000, 'mean beta_hat']:.5f} vs beta0 = {1 / T0:.5f}")
+        ratio = TSFIT["sd(beta_hat)"] / TSFIT["theory 1/sqrt(n V)"]
+        check("N1.7.3b", bool(((ratio > 0.85) & (ratio < 1.15)).all()), f"empirical sd / theoretical 1/sqrt(nV) lies in [{ratio.min():.2f}, {ratio.max():.2f}] for all n")
+        Zc, yc = draw(3000, rng7); bnew, _ = newton_beta(Zc, yc)
+        Tsrc = temperature_scale(Zc, yc)
+        check("N1.7.3c", abs(1 / bnew - Tsrc) < 2e-3, f"own Newton solver T = {1 / bnew:.5f} vs src.calibration.temperature_scale T = {Tsrc:.5f}")
+        gps = np.linspace(0.3, 1.2, 91)
+        nllc = np.array([-np.log(softmax_rows(b * Zc)[np.arange(len(yc)), yc]).mean() for b in gps])
+        check("N1.7.3d", bool(np.all(np.diff(nllc, 2) > -1e-9)), "NLL(beta) is convex on the grid (second differences >= 0), as the log-sum-exp argument requires")
+        check("N1.7.3e", abs(gps[int(np.argmin(nllc))] - bnew) < (gps[1] - gps[0]), f"grid minimiser {gps[int(np.argmin(nllc))]:.3f} agrees with the Newton root {bnew:.3f}")
+        fig, axs = plt.subplots(1, 2, figsize=(12.5, 4.4))
+        axs[0].plot(gps, nllc, color="k", lw=1.8, label="NLL(beta), n = 3000")
+        _, Vc = newton_beta(Zc, yc)
+        axs[0].plot(gps, nllc.min() + 0.5 * Vc * (gps - bnew) ** 2, ls="--", color="#d62728", label="quadratic approximation at beta_hat")
+        axs[0].axvline(1 / T0, color=ACOL["wide"], ls=":", label=f"true beta0 = 1/{T0}"); axs[0].axvline(1.0, color="#999", ls=":", label="beta = 1 (uncalibrated)")
+        axs[0].set_xlabel("beta = 1/T"); axs[0].set_ylabel("calibration NLL"); axs[0].legend(fontsize=8); axs[0].set_title("Convex one-parameter likelihood")
+        axs[1].errorbar(TSFIT.index, TSFIT["mean beta_hat"], yerr=TSFIT["sd(beta_hat)"], marker="o", capsize=3, color="k", label="beta_hat: mean +/- sd over 60 fits")
+        axs[1].fill_between(TSFIT.index, 1 / T0 - TSFIT["theory 1/sqrt(n V)"], 1 / T0 + TSFIT["theory 1/sqrt(n V)"], color=ACOL["wide"], alpha=0.25, label="beta0 +/- 1/sqrt(n V)")
+        axs[1].axhline(1 / T0, color=ACOL["wide"], lw=1); axs[1].set_xscale("log"); axs[1].set_xlabel("calibration-set size n"); axs[1].set_ylabel("beta_hat"); axs[1].legend(fontsize=8)
+        axs[1].set_title("Consistency and the 1/sqrt(nV) standard error")
+        varied("N1.7.f3", nllc, TSFIT["sd(beta_hat)"].values)
+        plt.tight_layout(); savefig(fig, "fig7_3_temperature_mle.png")
         """),
 
         md(r"""
-### Clipping breaks the SNR bookkeeping: compare against the right reference
+        ### How to read this chart
 
-`add_white_noise` sets the noise power from *whatever waveform it is given*. If that waveform was first clipped, the requested SNR is honoured **relative to the clipped signal**. But the clipping itself is an error relative to the ideal, unclipped signal $a\,x$, so an evaluation that scores "SNR versus the intended signal" sees the noise **plus** the clipping distortion.
+        Left: the calibration NLL as a function of $\beta=1/T$ on one constructed calibration set of $3000$ examples.
+        The black curve is convex with a single minimum; the red dashed parabola is the second-order approximation
+        $\mathrm{NLL}(\hat\beta)+\frac12\overline V(\beta-\hat\beta)^2$ and hugs the curve near the minimum, which is
+        why the likelihood gain from scaling grows with the squared distance of $\hat\beta$ from $1$. The green dotted
+        line is the true $\beta_0=1/1.6$ and the grey dotted line marks $\beta=1$ (no scaling). Right: as $n$ grows
+        the estimates (black, mean and standard deviation over $60$ fits) converge on $\beta_0$, and their spread
+        stays inside the green band $\beta_0\pm1/\sqrt{n\overline V}$. The band is tight even at $n=200$. What this says
+        about our real temperatures: a single fitted temperature on $1080$ calibration clips is statistically
+        well determined *for the calibration set's own distribution*, so its uncertainty is not the main concern; the
+        main concerns are seed variance and distribution shift, neither of which this estimator addresses.
 
-Let $x_c$ be the clipped signal and $D$ the clip distortion power from the previous cell. With noise variance $\sigma_n^2=P_c/10^{\rho/10}$ independent of $x_c$, the residual against the unclipped reference is $n+(x_c-a x)$, whose expected power is $\sigma_n^2+D$ (the cross term has zero mean because $n$ is zero-mean and independent). Therefore
+        ### 7.4 Conformal risk control: estimator, guarantee, and the O(1/n) gap
 
-$$\mathbb E\big[\widehat{\mathrm{SNR}}_{\text{vs unclipped}}\big]\approx10\log_{10}\frac{P_{ax}}{\sigma_n^2+D},\qquad\mathbb E\big[\widehat{\mathrm{SNR}}_{\text{vs clipped}}\big]\approx\rho.$$
+        (Angelopoulos et al., arXiv:2208.02814; turns 2 and 3 of the earlier session.) Let $L_1,\dots,L_{n+1}$ be
+        exchangeable, non-increasing, right-continuous loss functions of a scalar $\lambda$ with $L_i\le B$ and
+        $L_i(\lambda_{\max})\le\alpha$. With $\hat R_n(\lambda)=\frac1n\sum_{i\le n}L_i(\lambda)$ the estimator is
+        $$\hat\lambda=\inf\Big\{\lambda:\ \tfrac{n}{n+1}\hat R_n(\lambda)+\tfrac{B}{n+1}\le\alpha\Big\},$$
+        and $\hat\lambda=\lambda_{\max}$ if the set is empty. **Guarantee**: $\mathbb{E}[L_{n+1}(\hat\lambda)]\le\alpha$.
 
-This has a sharp consequence: as $\rho\to\infty$ the first expression saturates at $10\log_{10}(P_{ax}/D)$, the SDR, no matter how quiet the added noise is. We test three things. (i) Against the *clipped* reference the error is just Monte Carlo noise (the operator does what it says). (ii) Against the *unclipped* reference the measured SNR matches the formula above within $3$ standard errors of the mean over noise draws. (iii) The control gain $0$ dB, where the limiter does nothing, gives identical values for the two references, and at $+12$ dB the shortfall is larger than $3$ standard errors of the paired difference.
+        *Proof sketch.* Define the oracle $\lambda'=\inf\{\lambda:R_{n+1}(\lambda)\le\alpha\}$ using all $n+1$ losses, where
+        $R_{n+1}=\frac{n}{n+1}\hat R_n+\frac1{n+1}L_{n+1}$. (1) $\lambda'$ is a symmetric function of the $n+1$
+        losses. (2) Because $L_{n+1}\le B$, $R_{n+1}(\lambda)\le\frac n{n+1}\hat R_n(\lambda)+\frac B{n+1}$, so every
+        $\lambda$ accepted by the estimator is accepted by the oracle: $\lambda'\le\hat\lambda$. (3) Monotonicity gives
+        $L_{n+1}(\hat\lambda)\le L_{n+1}(\lambda')$. (4) Right-continuity gives $R_{n+1}(\lambda')\le\alpha$. (5) By
+        exchangeability $\mathbb{E}L_{n+1}(\lambda')=\mathbb{E}R_{n+1}(\lambda')\le\alpha$. Hence
+        $\mathbb{E}L_{n+1}(\hat\lambda)\le\alpha$. Note that $\hat\lambda$ itself is *not* symmetric in the $n+1$
+        losses; only the oracle is.
+
+        **Indicator loss, closed form.** With $L_i(\lambda)=\mathbb 1\{\lambda<s_i\}$ for a score $s_i$ (a set misses its
+        label when the threshold is below the label's score), $B=1$ and $\hat\lambda$ is the $k$-th largest calibration score,
+        $k=\lfloor\alpha(n+1)\rfloor$. For continuous scores the test score exceeds it with probability exactly
+        $k/(n+1)$, so
+        $$\mathbb{E}\,L_{n+1}(\hat\lambda)=\frac{\lfloor\alpha(n+1)\rfloor}{n+1}\in\Big(\alpha-\frac1{n+1},\ \alpha\Big].$$
+        The under-coverage gap is therefore at most $1/(n+1)=O(1/n)$, and it is a *sawtooth* in $n$ that touches
+        zero whenever $\alpha(n+1)$ is an integer. In terms of the project's `crc_threshold`, which works on the
+        true-label probability $p=1-s$, the threshold is the $k$-th smallest calibration probability, and a test
+        example is missed when its probability falls below it.
+
+        **Rao-Blackwell shortcut for the Monte Carlo.** For scores with a known CDF $F$, the conditional miscoverage
+        given the calibration set is $F(\hat p)$ (with $\hat p$ the threshold), so averaging $F(\hat p)$ over
+        repetitions has far smaller variance than averaging the $0/1$ misses. That makes the $O(1/n)$ gap resolvable
+        at moderate repetition counts. The next cell does this for uniform scores and, as a check of the
+        distribution-free claim, for a skewed Beta distribution, and then breaks exchangeability on purpose.
         """),
 
         code(r"""
-# S8.4 clipping vs the SNR reference: gain 0 dB (control, limiter inactive) and +12 dB; noise targets 30/20/10/0 dB; R=50 seeds; n=16000
-n_R_clip = 50
-n_clip_res = {}
-for n_g in (0.0, 12.0):
-    n_xu = n_gain[n_g]["out"].astype(np.float64)            # ideal (unclipped) reference a*x
-    n_xc32 = n_gain[n_g]["clip"]                             # what the operator is actually given
-    n_xc = n_xc32.astype(np.float64)
-    n_pu, n_pc, n_d = float(np.mean(n_xu ** 2)), float(np.mean(n_xc ** 2)), n_gain[n_g]["dist"]
-    for n_t in n_snr_targets:
-        n_vs_c, n_vs_u = [], []
-        for n_r in range(n_R_clip):
-            n_noisy, _ = audio.add_white_noise(n_xc32, sample_rate=n_sr, snr_db=n_t, seed=RNG_SEED + 8500 + 100 * int(n_t) + n_r)
-            n_nz = n_noisy.astype(np.float64)
-            n_vs_c.append(10 * np.log10(n_pc / np.mean((n_nz - n_xc) ** 2)))
-            n_vs_u.append(10 * np.log10(n_pu / np.mean((n_nz - n_xu) ** 2)))
-        n_pred = 10 * np.log10(n_pu / (n_pc / 10 ** (n_t / 10) + n_d))
-        n_clip_res[(n_g, n_t)] = dict(vs_c=np.array(n_vs_c), vs_u=np.array(n_vs_u), pred=n_pred)
-        print(f"gain {n_g:+5.1f} dB target {n_t:5.1f}: vs clipped {np.mean(n_vs_c):7.3f} | vs unclipped {np.mean(n_vs_u):7.3f} | predicted {n_pred:7.3f} dB")
+        # N1.7.4: CRC Monte Carlo (FIXTURE: iid true-label probabilities) with Rao-Blackwellised miscoverage; distribution-free check; shift.
+        from src.calibration import crc_threshold
+        def k_of(n, a):
+            return int(np.floor(a * (n + 1) + 1e-12))
+        rngC = np.random.default_rng(RNG_SEED + 74)
+        NC_ = [19, 49, 99, 199, 499, 999]; ALPHAS = [0.05, 0.10, 0.20]; REPS = 6000
+        unif = (lambda x: x, lambda rng, s: rng.uniform(size=s))
+        skew = (lambda x: stats.beta.cdf(x, 0.4, 2.5), lambda rng, s: rng.beta(0.4, 2.5, size=s))
+        rows = []
+        for name, (cdf, samp) in {"uniform": unif, "skewed Beta(0.4, 2.5)": skew}.items():
+            for n in NC_:
+                Ssorted = np.sort(samp(rngC, (REPS, n)), axis=1)              # sort once per (distribution, n)
+                for a in ALPHAS:
+                    if a * (n + 1) < 1: continue
+                    k = k_of(n, a); mis = cdf(Ssorted[:, k - 1])                # Rao-Blackwell: conditional miscoverage F(threshold)
+                    cf = k / (n + 1)
+                    rows.append({"scores": name, "alpha": a, "n": n, "k": k, "MC E[miscov]": mis.mean(), "SE": mis.std(ddof=1) / np.sqrt(REPS),
+                                 "closed form": cf, "gap alpha - E": a - mis.mean(), "1/(n+1)": 1 / (n + 1)})
+        CRC = pd.DataFrame(rows)
+        z_ = (CRC["MC E[miscov]"] - CRC["closed form"]) / CRC["SE"]
+        display(CRC[CRC.scores == "uniform"].round(5).head(12))
+        check("N1.7.4a", bool((z_.abs() < 4).all()), f"Monte Carlo matches floor(alpha(n+1))/(n+1) in all {len(CRC)} cells (max |z| = {z_.abs().max():.2f})")
+        check("N1.7.4b", bool((CRC["MC E[miscov]"] <= CRC["alpha"] + 4 * CRC["SE"]).all()), "Theorem 1: E[miscoverage] <= alpha in every cell (within 4 SE)")
+        check("N1.7.4c", bool((CRC["gap alpha - E"] < CRC["1/(n+1)"] + 4 * CRC["SE"]).all()), "the shortfall alpha - E stays below 1/(n+1) (the O(1/n) lower bound)")
+        sk = CRC[CRC.scores != "uniform"]; un = CRC[CRC.scores == "uniform"]
+        zsk = np.abs((sk["MC E[miscov]"].values - sk["closed form"].values) / sk["SE"].values)
+        check("N1.7.4d", bool(np.allclose(sk["closed form"].values, un["closed form"].values)) and float(zsk.max()) < 4,
+              "distribution-free: a skewed Beta score distribution gives the same closed-form expectation")
+        # cross-check against the project's crc_threshold on explicit rows
+        Pchk = rngC.uniform(size=(300, 99)); ok = all(abs(crc_threshold(Pchk[i], 0.10) - np.sort(Pchk[i])[k_of(99, 0.10) - 1]) < 1e-15 for i in range(300))
+        check("N1.7.4e", ok, "src.calibration.crc_threshold equals the k-th smallest true-label probability, k = floor(alpha(n+1)), on 300 draws (n=99, alpha=0.10)")
+        check("N1.7.4f", crc_threshold(np.array([0.3, 0.7, 0.9]), 0.05) == 0.0, "infeasible alpha (alpha(n+1) < 1): crc_threshold returns 0.0, the empty-set fallback")
+        # exchangeability broken: test probabilities drawn with CDF x^g (g<1 -> harder examples than calibration)
+        GAM = np.array([1.0, 0.9, 0.8, 0.6, 0.4]); n0, a0 = 99, 0.10
+        th0 = np.sort(rngC.uniform(size=(REPS, n0)), axis=1)[:, k_of(n0, a0) - 1]
+        SHIFT = np.array([np.mean(th0 ** g) for g in GAM])
+        check("N1.7.4g", abs(SHIFT[0] - k_of(n0, a0) / (n0 + 1)) < 0.003 and bool(np.all(np.diff(SHIFT) > 0)), f"with exchangeability the miscoverage is {SHIFT[0]:.3f} (=k/(n+1)); as the test distribution gets harder it climbs: {np.round(SHIFT, 3).tolist()}")
+        check("N1.7.4h", SHIFT[-1] > 2 * a0, f"a moderate shift (gamma=0.4) more than doubles the miscoverage to {SHIFT[-1]:.3f} at target alpha = {a0}")
+        """),
 
-n_tol_c = 3 * n_se_db / np.sqrt(n_R_clip)
-n_ok_c = all(abs(n_clip_res[(12.0, t)]["vs_c"].mean() - t) <= n_tol_c for t in n_snr_targets)
-n_ok_u = all(abs(n_clip_res[(12.0, t)]["vs_u"].mean() - n_clip_res[(12.0, t)]["pred"]) <= 3 * n_clip_res[(12.0, t)]["vs_u"].std(ddof=1) / np.sqrt(n_R_clip) for t in n_snr_targets)
-n_ctrl = all(np.allclose(n_clip_res[(0.0, t)]["vs_c"], n_clip_res[(0.0, t)]["vs_u"], atol=1e-9) for t in n_snr_targets)
-n_dif = n_clip_res[(12.0, 30.0)]["vs_c"] - n_clip_res[(12.0, 30.0)]["vs_u"]
-n_short_lo = n_dif.mean() - 3 * n_dif.std(ddof=1) / np.sqrt(n_R_clip)
-check("S8.6", n_ok_c, f"+12 dB: SNR vs clipped reference equals the request within 3 SE (tol {n_tol_c:.4f} dB) for all 4 targets")
-check("S8.7", n_ok_u, "+12 dB: SNR vs unclipped reference matches 10log10(P_ax/(sigma^2+D)) within 3 SE of the mean for all 4 targets")
-check("S8.8", n_ctrl and n_short_lo > 0, f"control (0 dB) gives identical references; at +12 dB / 30 dB the shortfall {n_dif.mean():.2f} dB has lower 3-SE bound {n_short_lo:.2f} dB > 0")
-n_sdr12 = 10 * np.log10(n_gain[12.0]["power"] / n_gain[12.0]["dist"])
-print(f"SNR ceiling when scored against the unclipped signal at +12 dB gain: SDR = {n_sdr12:.2f} dB")
+        code(r"""
+        # Figure 7.4: the O(1/n) gap (left) and the failure under a broken-exchangeability shift (right).
+        fig, axs = plt.subplots(1, 2, figsize=(12.5, 4.5))
+        for a, c_ in zip(ALPHAS, ["#1f77b4", "#ff7f0e", "#2ca02c"]):
+            s_ = CRC[(CRC.scores == "uniform") & (CRC.alpha == a)]
+            axs[0].errorbar(s_.n, np.maximum(s_["gap alpha - E"], 1e-5), yerr=1.96 * s_.SE, marker="o", color=c_, capsize=3, label=f"alpha = {a} (MC)")
+            axs[0].plot(s_.n, [a - k_of(n, a) / (n + 1) for n in s_.n], ls=":", color=c_, lw=1.2)
+        axs[0].plot(NC_, [1 / (n + 1) for n in NC_], color="k", lw=1.4, label="1/(n+1) bound")
+        axs[0].set_xscale("log"); axs[0].set_yscale("log"); axs[0].set_xlabel("calibration size n"); axs[0].set_ylabel("shortfall  alpha - E[miscoverage]")
+        axs[0].legend(fontsize=8); axs[0].set_title("Guarantee gap is O(1/n) (dotted: closed-form sawtooth)")
+        axs[1].plot(GAM, SHIFT, marker="o", color="#d62728", lw=1.8, label="achieved miscoverage")
+        axs[1].axhline(a0, color="k", ls="--", label=f"target alpha = {a0}"); axs[1].invert_xaxis()
+        axs[1].set_xlabel("shift strength: test CDF = x^gamma (1 = exchangeable, smaller = harder)"); axs[1].set_ylabel("achieved miscoverage")
+        axs[1].legend(fontsize=8); axs[1].set_title("The guarantee needs exchangeability")
+        varied("N1.7.f4", CRC["MC E[miscov]"].values, SHIFT)
+        plt.tight_layout(); savefig(fig, "fig7_4_crc_gap_and_shift.png")
         """),
 
         md(r"""
-### Reverberation: why the earlier low-pass-like kernel was not a room, and the RIR operator that replaces it
+        ### How to read this chart
 
-The first version of the reverb operator, `src.audio.apply_reverb(decay_seconds)`, built a kernel from a decaying exponential **normalised to sum one** and then added $0.5$ to the first tap. That kernel has two properties that make it a poor stand-in for a room. Its sum-to-one tail is a smooth, non-negative, one-sided decay, hence a low-pass filter; and the added first tap carries almost all of the kernel's energy, so it behaves mostly as a fixed attenuation that is nearly the same for every `decay_seconds`. Nothing in it controls the *direct-to-reverberant ratio*, and the decay time is not measured, only requested. We demonstrate this below rather than assert it.
-
-The replacement, `src.audio.apply_rir_reverb(waveform, *, sample_rate, rt60_seconds, drr_db=0.0, seed=0)`, uses a synthetic room impulse response with the standard exponential-decay model of diffuse reverberation:
-
-$$h[0]=1,\qquad h[k]=c\,\varepsilon_k\,10^{-3k/(f_s\,T_{60})}\quad(k\ge1),\quad\varepsilon_k\sim\mathcal N(0,1).$$
-
-The amplitude envelope $10^{-3t/T_{60}}$ has power $10^{-6t/T_{60}}$, i.e. exactly $-60$ dB at $t=T_{60}$, which is the definition of the reverberation time. The scalar $c$ is chosen so that $\mathrm{DRR}=10\log_{10}\big(h[0]^2/\sum_{k\ge1}h[k]^2\big)$ equals the request. The output is the convolution of the input with $h$, rescaled to keep the input RMS ("level matched") so that reverberation is not confounded with a gain change. The record returned by the operator carries `measured_drr_db` and `measured_rt60_seconds`.
-
-**We do not trust those two record fields by themselves.** We recover the applied impulse response independently by passing a unit impulse through the operator (a convolution with $\delta$ returns $h$ up to the known level scale) and re-measure both quantities with our own code. DRR is scale-invariant. For $T_{60}$ we use Schroeder backward integration: the energy decay curve is $\mathrm{EDC}(t)=10\log_{10}\big(\sum_{\tau\ge t}h[\tau]^2/\sum_\tau h[\tau]^2\big)$; a line fitted over the $-5$ to $-35$ dB range is extrapolated to $-60$ dB, giving $\hat T_{60}=-60/\text{slope}$. Because the tail is random noise, $\hat T_{60}$ varies with the seed, so we test the *mean over seeds* against the request within $3$ standard errors.
+        Left: on log-log axes, the shortfall $\alpha-\mathbb{E}[\text{miscoverage}]$ of the conformal estimator against
+        the calibration size $n$, for three targets. Coloured markers with whiskers are Rao-Blackwellised Monte-Carlo
+        estimates; dotted lines are the exact closed form $\alpha-\lfloor\alpha(n+1)\rfloor/(n+1)$, a sawtooth that dips
+        to zero whenever $\alpha(n+1)$ is an integer (the markers at zero are drawn at a floor of $10^{-5}$ because
+        the axis is logarithmic); the black line is the $1/(n+1)$ envelope. Every marker sits under the envelope, and
+        the envelope falls with slope $-1$: that is the $O(1/n)$ statement. Right: the same procedure when the test
+        distribution is progressively *harder* than the calibration distribution ($\gamma<1$). At $\gamma=1$
+        (exchangeable) the miscoverage equals its target-adjacent closed form; as $\gamma$ falls it climbs steeply
+        past the dashed target line. The reading to carry over to the speech setting is the right panel, not the
+        left: the finite-sample guarantee is a theorem about exchangeable data, and a shifted test set falls
+        outside it.
         """),
 
         code(r"""
-# S8.5 verify apply_rir_reverb: recover h by impulse response; RT60 in {0.1,0.3,0.6} s, DRR in {-5,0,+5} dB; R=100 seeds at DRR=0, R=20 otherwise
-def n_recover_h(rt60, drr, seed):
-    n_len = int(np.ceil(rt60 * n_sr)) + 1                       # RIR length used by the operator
-    n_delta = np.zeros(n_len, dtype=np.float32); n_delta[0] = 1.0
-    n_o, n_rec = audio.apply_rir_reverb(n_delta, sample_rate=n_sr, rt60_seconds=rt60, drr_db=drr, seed=seed)
-    return n_o.astype(np.float64), n_rec
-
-def n_drr_of(h):
-    return 10 * np.log10(h[0] ** 2 / np.sum(h[1:] ** 2))
-
-def n_edc_db(h):
-    n_e = np.cumsum((h ** 2)[::-1])[::-1]
-    return 10 * np.log10(np.maximum(n_e / n_e[0], 1e-30))
-
-def n_rt60_of(h):
-    n_edc = n_edc_db(h)
-    n_i = np.where((n_edc <= -5.0) & (n_edc >= -35.0))[0]
-    return -60.0 / np.polyfit(n_i / n_sr, n_edc[n_i], 1)[0]
-
-n_rir = {}
-for n_rt in (0.1, 0.3, 0.6):
-    for n_drr in (-5.0, 0.0, 5.0):
-        n_reps = 100 if n_drr == 0.0 else 20
-        n_hs = [n_recover_h(n_rt, n_drr, RNG_SEED + 8700 + n_s) for n_s in range(n_reps)]
-        n_rir[(n_rt, n_drr)] = dict(
-            drr=np.array([n_drr_of(h) for h, _ in n_hs]), rt60=np.array([n_rt60_of(h) for h, _ in n_hs]),
-            rec_drr=np.array([r["measured_drr_db"] for _, r in n_hs]), rec_rt60=np.array([r["measured_rt60_seconds"] for _, r in n_hs]),
-            first_h=n_hs[0][0])
-
-n_drr_err = max(np.abs(v["drr"] - d).max() for (r, d), v in n_rir.items())
-n_rec_drr_err = max(np.abs(v["rec_drr"] - v["drr"]).max() for v in n_rir.values())
-n_rec_rt_err = max(np.abs(v["rec_rt60"] - v["rt60"]).max() for v in n_rir.values())
-n_z = {k: (v["rt60"].mean() - k[0]) / (v["rt60"].std(ddof=1) / np.sqrt(len(v["rt60"]))) for k, v in n_rir.items()}
-for n_k, n_v in n_rir.items():
-    print(f"RT60 req {n_k[0]:.1f} s, DRR req {n_k[1]:+.0f} dB: recovered DRR {n_v['drr'].mean():+.5f} dB; RT60 mean {n_v['rt60'].mean():.4f} s, SD {n_v['rt60'].std(ddof=1):.4f} s (z={n_z[n_k]:+.2f}, R={len(n_v['rt60'])})")
-check("S8.9", n_drr_err < 1e-5, f"recovered DRR equals requested DRR: worst |error| {n_drr_err:.2e} dB < 1e-5 dB (float32 storage)")
-check("S8.10", max(abs(z) for z in n_z.values()) <= 3.0, f"mean recovered RT60 within 3 SE of request in all 9 conditions: worst |z|={max(abs(z) for z in n_z.values()):.2f}")
-check("S8.11", n_rec_drr_err < 1e-5 and n_rec_rt_err < 1e-6, f"record fields agree with independent recovery: DRR diff {n_rec_drr_err:.1e} dB, RT60 diff {n_rec_rt_err:.1e} s")
-        """),
-
-        code(r"""
-# S8.6 level matching, determinism and legacy-kernel demonstration; waveform n_waveform, seeds fixed, no Monte Carlo
-n_lvl = []
-for n_rt in (0.1, 0.3, 0.6):
-    for n_drr in (-5.0, 0.0, 5.0):
-        n_y, n_rec = audio.apply_rir_reverb(n_waveform, sample_rate=n_sr, rt60_seconds=n_rt, drr_db=n_drr, seed=RNG_SEED + 8)
-        n_lvl.append(abs(np.sqrt(np.mean(n_y.astype(np.float64) ** 2) / n_sig_pow) - 1.0))
-n_y1, _ = audio.apply_rir_reverb(n_waveform, sample_rate=n_sr, rt60_seconds=0.3, seed=5)
-n_y2, _ = audio.apply_rir_reverb(n_waveform, sample_rate=n_sr, rt60_seconds=0.3, seed=5)
-n_y3, _ = audio.apply_rir_reverb(n_waveform, sample_rate=n_sr, rt60_seconds=0.3, seed=6)
-check("S8.12", max(n_lvl) < 1e-5, f"output RMS equals input RMS in all 9 conditions: worst relative error {max(n_lvl):.2e}")
-check("S8.13", np.array_equal(n_y1, n_y2) and np.abs(n_y1 - n_y3).max() > 1e-3, f"same seed reproduces output bit-for-bit; different seed differs by up to {np.abs(n_y1 - n_y3).max():.3f}")
-
-# legacy kernel recovered from an impulse: audio.apply_reverb(decay_seconds)
-n_legacy = {}
-for n_dec in (0.1, 0.3, 0.6):
-    n_len = int(round(n_sr * n_dec))
-    n_d0 = np.zeros(2 * n_len, dtype=np.float32); n_d0[0] = 1.0
-    n_h_old = audio.apply_reverb(n_d0, sample_rate=n_sr, decay_seconds=n_dec)[0].astype(np.float64)[:n_len]
-    n_w_old = audio.apply_reverb(n_waveform, sample_rate=n_sr, decay_seconds=n_dec)[0].astype(np.float64)
-    n_spec = np.abs(np.fft.rfft(n_h_old, 4 * n_sr)); n_f = np.fft.rfftfreq(4 * n_sr, 1 / n_sr)
-    n_legacy[n_dec] = dict(h=n_h_old, drr=n_drr_of(n_h_old), first_frac=n_h_old[0] ** 2 / np.sum(n_h_old ** 2),
-                           rms_ratio=np.sqrt(np.mean(n_w_old ** 2) / n_sig_pow), mag_1k=float(n_spec[np.argmin(np.abs(n_f - 1000.0))]))
-    print(f"legacy decay {n_dec:.1f} s: DRR {n_legacy[n_dec]['drr']:.2f} dB, energy share of tap 0 {n_legacy[n_dec]['first_frac']:.4f}, "
-          f"output/input RMS {n_legacy[n_dec]['rms_ratio']:.3f}, |H(1 kHz)| {n_legacy[n_dec]['mag_1k']:.3f}")
-note("S8.14", f"legacy kernel is not a room: DRR is fixed by construction (about {np.mean([v['drr'] for v in n_legacy.values()]):.1f} dB averaged over decays, "
-     f"no control), output/input RMS spans only {min(v['rms_ratio'] for v in n_legacy.values()):.3f}-{max(v['rms_ratio'] for v in n_legacy.values()):.3f} across a 6x range of decay, "
-     f"so it acts mostly as an attenuation; the RIR operator at DRR 0 dB is level matched and controls both quantities")
+        # N1.7.5: REAL conformal outputs stored in the result files: achieved miscoverage vs target alpha, per arm and condition.
+        rows = []
+        for a in ARCHS:
+            for c in CONDS:
+                crc = S(a, c)["crc"]
+                for al in ("0.05", "0.1"):
+                    rows.append({"arch": a, "cond": c, "alpha": float(al), "achieved miscoverage": crc[al]["miscoverage"], "mean set size": crc[al]["mean_set_size"], "threshold": crc[al]["threshold"]})
+        CR = pd.DataFrame(rows)
+        display(CR.pivot_table(index=["arch", "cond"], columns="alpha", values=["achieved miscoverage", "mean set size"]).round(4))
+        cl = CR[CR.cond == "clean"]; nz = CR[CR.cond == "noise_10"]
+        sd_ = np.sqrt(2 * cl["alpha"] * (1 - cl["alpha"]) / N_TEST)     # calibration-threshold noise + test sampling noise, each ~ sqrt(alpha(1-alpha)/1080)
+        zc_ = (cl["achieved miscoverage"] - cl["alpha"]) / sd_
+        check("N1.7.5a", bool((zc_ < 3).all()), f"on clean, achieved miscoverage exceeds target by at most {zc_.max():.2f} standard deviations of single-split noise (pre-declared rule: z < 3)")
+        note("N1.7.5a2", f"two clean cells sit at z = {sorted(zc_.round(2).tolist())[-2]:.2f} and {sorted(zc_.round(2).tolist())[-1]:.2f}: mild, unproven excess on one split; not evidence of a violation, not evidence of none")
+        check("N1.7.5b", bool((nz["achieved miscoverage"] > 3 * nz["alpha"]).all()), f"on noise_10 every arm's miscoverage exceeds 3x target (min {nz['achieved miscoverage'].min():.3f}): the guarantee does not transfer across the shift, as Section 7.4 predicts")
+        check("N1.7.5c", abs(float(nz[(nz.arch == 'gru') & (nz.alpha == 0.05)]['achieved miscoverage'].iloc[0]) - 0.7565) < 5e-4, "gru noise_10 at alpha = 0.05: achieved miscoverage 0.7565")
+        note("N1.7.5d", "calibration split (n=1080) draws clean audio; noise_10 test clips are not exchangeable with it, so a miscoverage above alpha is the EXPECTED behaviour, not an implementation bug")
+        fig, ax = plt.subplots(figsize=(11, 4.4))
+        lab = [f"{a}\n{c}" for a in ARCHS for c in CONDS]; xs = np.arange(len(lab))
+        for al, mk, col in ((0.05, "o", "#1f77b4"), (0.1, "s", "#ff7f0e")):
+            v = [CR[(CR.arch == a) & (CR.cond == c) & (CR.alpha == al)]["achieved miscoverage"].iloc[0] for a in ARCHS for c in CONDS]
+            ax.scatter(xs, v, marker=mk, s=55, color=col, label=f"achieved, target alpha = {al}", zorder=3)
+            ax.axhline(al, color=col, ls="--", lw=1)
+        ax.set_xticks(xs); ax.set_xticklabels(lab, fontsize=7); ax.set_ylabel("achieved test miscoverage"); ax.set_yscale("log"); ax.legend(fontsize=8)
+        ax.set_title("Real CRC outputs: modest excess on clean and mild shifts, 5-15x target under noise_10")
+        varied("N1.7.f5", CR["achieved miscoverage"].values)
+        savefig(fig, "fig7_5_real_crc.png")
         """),
 
         md(r"""
-### Figure: what the four conditions look like
+        ### How to read this chart
 
-The next cell draws the waveform and a Hann-windowed spectrogram (512-sample window, 50 % overlap) for the clean signal, the $+12$ dB signal after the emulated limiter, the noise condition at a $10$ dB requested SNR, and the RIR reverb at $T_{60}=0.3$ s with $\mathrm{DRR}=0$ dB. Colour is power spectral density in dB relative to the loudest cell of the clean spectrogram, over an $80$ dB range, so panels are directly comparable.
+        Each marker is one arm-and-condition pair from the stored conformal results; blue circles correspond to a
+        target of $\alpha=0.05$ and orange squares to $\alpha=0.10$, whose target levels are the dashed horizontal
+        lines of the same colour, on a log axis. On `clean` the markers sit at or slightly above their dashed lines (within about $2.4$ single-split standard
+        deviations); on the mild `gain_+10` and `reverb_mid` conditions they are roughly $1.5$ to $2$ times the
+        target, as expected when the test set is shifted. On `noise_10` all markers are about $5$ to $15$ times the
+        target: for `gru` the achieved miscoverage is $0.756$ at a target of $0.05$. This is the real-data counterpart of the right panel of the
+        previous figure, and it is the predicted behaviour of an exchangeability-based guarantee under a severe shift.
+        It also echoes the Section 3 tension: for `gru` and `wide` at $\alpha=0.1$ the mean set size is only about $1.04$
+        to $1.09$ labels, yet the true label is missing $84\%$ and $70\%$ of the time.
 
-Before looking at the picture, note what we can quantify. The clean signal has a broadband burst in $[0.30,0.40]$ s and harmonics below $1$ kHz. Any energy above $2$ kHz *after* $0.40$ s must therefore come from the operator, not from the source. The cell after the figure measures that energy in a window $[0.42,0.52]$ s for $T_{60}\in\{0.1,0.3,0.6\}$ s. Since a fixed DRR fixes the total tail energy while a longer $T_{60}$ spreads it over more time, the fraction of tail energy landing in a window $[t_1,t_2]$ after the burst is approximately $e^{-2\alpha t_1}-e^{-2\alpha t_2}$ with $\alpha=3\ln10/T_{60}$ (ignoring truncation and the burst's own duration). With $t_1=0.02$ s and $t_2=0.12$ s after the burst ends, this expression is an increasing function of $T_{60}$ over the three values used here. That is the prediction we check.
-        """),
+        ### 7.5 What conformal risk control does not establish
 
-        code(r"""
-# S8.7 figure 1: waveforms + spectrograms for clean / +12 dB clipped / SNR 10 dB / RIR reverb (T60=0.3 s, DRR 0 dB); single seeds
-from scipy.signal import spectrogram as sp_spec
-
-n_noisy10, _ = audio.add_white_noise(n_waveform, sample_rate=n_sr, snr_db=10.0, seed=RNG_SEED + 8100)
-n_rev03, n_rev_rec = audio.apply_rir_reverb(n_waveform, sample_rate=n_sr, rt60_seconds=0.3, drr_db=0.0, seed=RNG_SEED + 8200)
-n_panels = [("Clean", n_waveform, PALETTE["clean"]), ("+12 dB, clipped at +-1", n_gain[12.0]["clip"], PALETTE["shifted"]),
-            ("Noise, SNR 10 dB", n_noisy10, PALETTE["mask"]), ("RIR reverb, T60 0.3 s, DRR 0 dB", n_rev03, PALETTE["acoustic"])]
-n_ref_db = 10 * np.log10(sp_spec(n_waveform, fs=n_sr, window="hann", nperseg=512, noverlap=256)[2].max() + 1e-12)
-
-n_fig, n_ax = plt.subplots(len(n_panels), 2, figsize=(14, 10))
-for n_i, (n_lab, n_w, n_col) in enumerate(n_panels):
-    n_ax[n_i, 0].plot(n_time, n_w, color=n_col, linewidth=0.5)
-    n_ax[n_i, 0].axvspan(n_burst_start / n_sr, n_burst_end / n_sr, color=PALETTE["band"], alpha=0.5, lw=0)
-    n_ax[n_i, 0].set_ylabel(n_lab, fontsize=8); n_ax[n_i, 0].set_xlim(0, n_duration)
-    n_f_, n_t_, n_sxx = sp_spec(n_w, fs=n_sr, window="hann", nperseg=512, noverlap=256)
-    n_im = n_ax[n_i, 1].pcolormesh(n_t_, n_f_, 10 * np.log10(n_sxx + 1e-12) - n_ref_db, cmap="viridis", shading="auto", vmin=-80, vmax=0)
-    n_ax[n_i, 1].set_ylabel("Frequency (Hz)"); n_ax[n_i, 1].axvline(n_burst_end / n_sr, color="white", ls="--", lw=0.8)
-n_ax[-1, 0].set_xlabel("Time (s)"); n_ax[-1, 1].set_xlabel("Time (s)")
-n_fig.colorbar(n_im, ax=n_ax[:, 1], label="dB re clean maximum")
-plt.show()
+        (i) It controls the *expected* loss over the joint draw of calibration and test points, not the loss on the
+        particular calibration set in hand; a single split gives a random $\hat\lambda$ whose realised risk fluctuates
+        around the guarantee. (ii) It is a marginal statement, not conditional on the input, the class, or the
+        speaker. (iii) It presupposes exchangeability between calibration and test, which Section 7.4's right panel
+        and the `noise_10` results show can fail badly under acoustic shift. (iv) The loss must be bounded and
+        monotone in $\lambda$; abstention-style losses that are not monotone are outside the theorem. (v) The
+        finite-sample gap is $O(1/n)$; at $n=1080$ that is under $0.1\%$ for indicator losses, which is not the binding
+        limitation.
         """),
 
         md(r"""
-### How to read this chart
+        ## 8. Limitations
 
-Left column: waveform amplitude against time. The grey band marks the source burst, $0.30$ to $0.40$ s. Right column: spectrogram, frequency against time, with colour equal to power in dB relative to the loudest cell of the clean panel; the dashed white line marks the end of the burst. Rows are the four conditions in the order clean, $+12$ dB with the emulated limiter, additive noise at a requested $10$ dB SNR, and RIR reverb.
+        Everything below limits how far this notebook's conclusions can be pushed. They are collected here so a
+        reader deciding how much weight a sentence deserves can find every caveat in one place. The first cell
+        re-derives from the artifacts the limitations that are checkable; the rest are recorded facts.
 
-What to look for. In the limiter row the waveform's extremes are cut at $\pm1$ instead of continuing to the larger scaled values, and the spectrogram shows energy at frequencies above the source's harmonics outside the burst (the cut waveform is no longer a sum of those few sinusoids). In the noise row the spectrogram floor is raised across all frequencies and times, including the silent tail of the utterance. In the reverb row, compare the time extent of the broadband content around the burst with the clean row: a room adds energy to the right of the dashed line, where the clean panel has none above the harmonics. The reverb row is level matched, so its amplitudes are not a gain change.
+        ### 8.1 Scale and coverage of the evidence
 
-The next cell replaces that visual impression with a number: energy above $2$ kHz after the burst has ended. The takeaway is that each operator leaves a distinct, measurable signature, and that none of these panels is evidence about real speech.
+        - **One training run per architecture.** The architecture race is a single seed. The legacy baseline, whose three
+          seeds ended at $0.3730$, $0.5913$ and $0.3433$, shows that seed-to-seed variation within one architecture
+          can exceed the between-architecture differences discussed in Sections 2 and 3. The `gru`-versus-`wide` gap
+          is small enough that this variation could reverse it; the gap between time-preserving arms and the
+          time-pooling baseline is large enough that it probably could not.
+        - **Exploration configuration.** The stress evaluation used $4$ conditions and $200$ bootstrap resamples, not
+          the design's publication configuration. Intervals are coarse and only one condition (`noise_10`) is additive
+          noise at one level, so no dose-response curve in SNR can be drawn, which is precisely what the CRNN paper's
+          "the gap narrows as SNR rises" claim would need.
+        - **Validation and test splits are small.** $504$ validation clips and $1080$ test clips: the binomial
+          standard error of an accuracy near $0.9$ is about $0.013$ and $0.009$ respectively, and Section 7.2 shows that the
+          noise floor of ECE at this size can be a few hundredths for spread-out confidences.
+        - **The headline numbers mix summaries.** $0.9008$ for `gru` is both its best-loss-epoch and last-epoch value;
+          $0.8790$ for `wide` is its peak, and its last epoch is $0.7540$ (Section 1.1).
+
+        ### 8.2 Neural-collapse deviations (Section 4)
+
+        1. **Held-out, not training, activations.** The paper computes $\mathrm{NC}_1$-$\mathrm{NC}_3$ on training-set
+           activations and only $\mathrm{NC}_4$ on held-out data; our probe is a fixed $120$-clip held-out split.
+        2. **Terminal phase not verified.** Training accuracy was not recorded. `gru` and `wide` are TPT-*plausible*
+           from their cross-entropy ($0.0100$, $0.0182$), which bounds training error at $1.4\%$ and $2.6\%$, not at the
+           paper's $0.1\%$; `timepool` ($0.9794$) is treated as not having entered TPT, a premise supported but not
+           proved by its loss. Neural collapse is therefore *undefined* for it.
+        3. **PCA in place of the papers' projections and full features.** The $\mathrm{NC}$ formulas are applied to a
+           two-dimensional PCA projection, refit every epoch, of the classifier's input, where the paper uses full
+           $p$-dimensional last-layer features; 2D equiangularity and maximal-angle measures have a planar floor of
+           about $0.67$ and $0.60$ and carry no $\mathrm{NC}_2$ information. The companion visualisation project's
+           SentryCam and MM-PHATE also specify a parametric autoencoder and a diffusion embedding respectively;
+           PCA stands in for both.
+
+        ### 8.3 Other method-fidelity notes
+
+        - **AutoClip off-by-one.** Our threshold uses the prior history; the paper appends the current norm first. On the
+          recorded norms this flips fewer than $1\%$ of clip decisions, but it is a real deviation. It is a
+          counterfactual on recorded norms, not a re-run.
+        - **AutoClip's $p=10$ is cross-task.** Tuned on WSJ0-2mix separation with BLSTMs; applied here, unchanged, to log-mel
+          classification. With $p=10$ the rule clips roughly nine steps in ten under stationary norms by construction, so
+          the measured clip rates ($99.1\%$, $70.2\%$, $65.8\%$) describe the *trend* of the norms rather than
+          instability. No run without clipping exists, so AutoClip's benefit here is untested.
+        - **Calibration.** No logits are stored, so fitted temperatures cannot be bootstrapped or re-derived, and no MDCA
+          model was trained. The `gru` $T^\star=1.0157$ versus `wide` $T^\star=1.6002$ contrast is an observation with one
+          run per arm.
+        - **ECE.** Depends on the bin count and has a positive noise floor at $n\approx1000$ (Section 7.2).
+        - **CRC.** Unweighted, so under a shifted test set the guarantee does not apply (Section 7.4).
+
+        ### 8.4 None of the parallels is causal
+
+        Sections 2, 3, 4, 5 and 6 each set a paper's claim next to a measurement. In every case the measurement is
+        an observation about one trained model per architecture. None of the parallels is a causal claim: we did not
+        ablate the recurrent head against a matched-capacity time-preserving head at several seeds, we did not vary the
+        clipping percentile, we did not train with a calibration objective, and we did not measure neural collapse on
+        training activations. The notebook's contribution is the mathematics, the traceable sources, and the list of
+        experiments that would turn each observation into a test.
         """),
 
         code(r"""
-# S8.8 reverb tail signature: energy above 2 kHz in the window 0.42-0.52 s (after the burst ends at 0.40 s); 5 seeds per T60, DRR 0 dB
-def n_hf_tail(x):
-    n_seg = x[int(0.42 * n_sr):int(0.52 * n_sr)].astype(np.float64) * np.hanning(int(0.52 * n_sr) - int(0.42 * n_sr))
-    n_p = np.abs(np.fft.rfft(n_seg)) ** 2
-    return float(n_p[np.fft.rfftfreq(len(n_seg), 1 / n_sr) > 2000.0].sum())
-
-n_hf_burst = float(np.sum(np.abs(np.fft.rfft(n_waveform[n_burst_start:n_burst_end].astype(np.float64) * np.hanning(n_burst_len))) ** 2
-                          * (np.fft.rfftfreq(n_burst_len, 1 / n_sr) > 2000.0)))
-n_hf_clean = n_hf_tail(n_waveform)
-n_hf = {}
-for n_rt in (0.1, 0.3, 0.6):
-    n_hf[n_rt] = float(np.mean([n_hf_tail(audio.apply_rir_reverb(n_waveform, sample_rate=n_sr, rt60_seconds=n_rt, drr_db=0.0, seed=RNG_SEED + 8300 + n_s)[0]) for n_s in range(5)]))
-print(f"HF energy (>2 kHz) in burst window {n_hf_burst:.3e}; clean tail window {n_hf_clean:.3e}")
-print("reverb tail window: " + ", ".join(f"T60 {r:.1f} s -> {v:.3e}" for r, v in n_hf.items()))
-check("S8.15", n_hf_clean < 1e-6 * n_hf_burst, f"the clean tail window has no HF content: {n_hf_clean:.2e} < 1e-6 x burst-window energy {n_hf_burst:.2e}")
-check("S8.16", n_hf_clean < n_hf[0.1] < n_hf[0.3] < n_hf[0.6], "HF energy after the burst is zero for clean and increases with T60 (0.1 < 0.3 < 0.6 s), as predicted from the exponential tail")
-        """),
-
-        code(r"""
-# Figure 2 (S8.9): SNR accuracy (left: residual realised-requested, R=200 draws per target) and clipping (right: SNR scored against clipped vs unclipped reference)
-n_fig2, (n_a, n_b) = plt.subplots(1, 2, figsize=(13, 4.5))
-for n_i, n_t in enumerate(n_snr_targets):
-    n_v = n_snr_real[n_t] - n_t
-    n_a.scatter(np.full(len(n_v), n_i) + np.random.default_rng(RNG_SEED + 8).uniform(-0.15, 0.15, len(n_v)), n_v, s=6, color=PALETTE["acoustic"], alpha=0.35)
-    n_a.errorbar(n_i, n_v.mean(), yerr=3 * n_se_db / np.sqrt(n_R_snr), color="black", capsize=6, marker="o")
-n_a.axhspan(-3 * n_se_db, 3 * n_se_db, color=PALETTE["band"], alpha=0.5, label="single draw: +-3 theoretical SD")
-n_a.axhline(0, color=PALETTE["reference"], ls="--")
-n_a.set_xticks(range(4)); n_a.set_xticklabels([f"{t:.0f}" for t in n_snr_targets])
-n_a.set_xlabel("Requested SNR (dB)"); n_a.set_ylabel("Realised - requested SNR (dB)"); n_a.set_title("Additive noise: realised SNR error"); n_a.legend(fontsize=8)
-
-n_tt = np.array(n_snr_targets)
-n_b.plot([-2, 32], [-2, 32], color=PALETTE["reference"], ls="--", label="y = x")
-n_b.plot(n_tt, [n_clip_res[(12.0, t)]["vs_c"].mean() for t in n_snr_targets], "o-", color=PALETTE["clean"], label="+12 dB, vs clipped reference")
-n_b.plot(n_tt, [n_clip_res[(12.0, t)]["vs_u"].mean() for t in n_snr_targets], "s-", color=PALETTE["shifted"], label="+12 dB, vs unclipped reference")
-n_b.plot(n_tt, [n_clip_res[(12.0, t)]["pred"] for t in n_snr_targets], "k:", label="prediction 10log10(P/(sigma^2+D))")
-n_b.axhline(n_sdr12, color=PALETTE["shifted"], alpha=0.4, lw=1)
-n_b.set_xlabel("Requested SNR (dB)"); n_b.set_ylabel("Realised SNR (dB)"); n_b.set_title("Clipping: which reference?"); n_b.legend(fontsize=8)
-plt.tight_layout(); plt.show()
-        """),
-
-        md(r"""
-### How to read this chart
-
-Left panel. Each small green point is one noise draw; the horizontal axis is the requested SNR, the vertical axis is realised minus requested SNR in dB, so $0$ is perfect agreement (dashed line). The grey band is $\pm3$ theoretical single-draw standard deviations from the delta-method formula, and the black marker with a bar is the mean over the $200$ draws with its $\pm3$ standard-error bar. Points scattered inside the band with the marker on the dashed line mean the operator delivers the requested SNR up to sampling noise; a marker off the line by more than its bar would be a bias.
-
-Right panel. The dashed diagonal is the ideal. The blue curve scores SNR against the clipped signal that was handed to the operator: it should hug the diagonal. The red curve scores against the unclipped scaled signal: it should fall below the diagonal at high requested SNR and flatten toward the horizontal red line, the signal-to-distortion ratio of the limiter. The black dotted curve is the closed-form prediction; agreement between it and the red curve is the test.
-
-Takeaway: additive-noise severity is reliable, but if clipping precedes it the *effective* SNR against the intended signal has a ceiling set by the clipping, so the reported severity must name its reference.
-        """),
-
-        code(r"""
-# Figure 3 (S8.10): energy decay curves of the applied RIR vs the legacy kernel (left), recovered RT60 vs requested with 3-SE bars (right); DRR 0 dB, R=100 seeds
-n_fig3, (n_l, n_r) = plt.subplots(1, 2, figsize=(13, 4.5))
-n_cols = [PALETTE["clean"], PALETTE["acoustic"], PALETTE["shifted"]]
-for n_c, n_rt in zip(n_cols, (0.1, 0.3, 0.6)):
-    n_h = n_rir[(n_rt, 0.0)]["first_h"]
-    n_l.plot(np.arange(len(n_h)) / n_sr * 1000, n_edc_db(n_h), color=n_c, label=f"RIR, T60={n_rt:.1f} s")
-    n_ho = n_legacy[n_rt]["h"]
-    n_l.plot(np.arange(len(n_ho)) / n_sr * 1000, n_edc_db(n_ho), color=n_c, ls="--", alpha=0.8, label=f"legacy kernel, decay={n_rt:.1f} s")
-n_l.axhline(-5, color=PALETTE["reference"], lw=0.8); n_l.axhline(-35, color=PALETTE["reference"], lw=0.8)
-n_l.set_ylim(-65, 2); n_l.set_xlim(0, 620)
-n_l.set_xlabel("Time (ms)"); n_l.set_ylabel("EDC (dB)"); n_l.set_title("Energy decay curves"); n_l.legend(fontsize=7)
-
-n_req = np.array([0.1, 0.3, 0.6])
-n_mean = np.array([n_rir[(r, 0.0)]["rt60"].mean() for r in n_req])
-n_se3 = np.array([3 * n_rir[(r, 0.0)]["rt60"].std(ddof=1) / np.sqrt(100) for r in n_req])
-n_r.plot([0, 0.7], [0, 0.7], color=PALETTE["reference"], ls="--", label="y = x")
-n_r.errorbar(n_req, n_mean, yerr=n_se3, fmt="o", color=PALETTE["acoustic"], capsize=5, label="mean of 100 seeds +-3 SE")
-n_r.set_xlabel("Requested T60 (s)"); n_r.set_ylabel("Recovered T60 (s)"); n_r.set_title("Reverberation time check"); n_r.legend(fontsize=8)
-plt.tight_layout(); plt.show()
-        """),
-
-        md(r"""
-### How to read this chart
-
-Left panel. The vertical axis is the Schroeder energy decay curve in dB (energy remaining after time $t$, relative to total), the horizontal axis is time in milliseconds. Solid curves are the applied RIR for three requested $T_{60}$ values; dashed curves of the same colour are the legacy kernel with the same requested decay. The two thin horizontal lines mark the $-5$ and $-35$ dB limits of the fitting range. A room-like response falls roughly along a straight line that reaches $-60$ dB at the requested $T_{60}$; the steeper the line, the shorter the reverberation.
-
-Compare the two families. The solid curves start at the top and fall along a line whose slope depends on the requested $T_{60}$. The dashed curves behave differently: nearly all of their energy sits in the first tap (the cell above prints the share), so each curve makes a large step down at the very start, then decays from that lower level and therefore reaches $-60$ dB before the requested $T_{60}$ instead of at it.
-
-Right panel. Requested $T_{60}$ on the horizontal axis, recovered $T_{60}$ on the vertical axis, with the diagonal as the ideal. The green markers are means over $100$ seeds with $\pm3$ standard-error bars. A marker whose bar overlaps the diagonal agrees with the request within sampling noise.
-
-Takeaway: the RIR operator's stated $T_{60}$ and DRR are properties we can measure, which the legacy kernel could not offer.
-        """),
-
-        code(r"""
-# S8.11 sanity: every operator output is finite float32 with the input length; recap of measured worst cases from this section (no new random draws)
-n_outs = {"gain+12 clipped": n_gain[12.0]["clip"], "noise 10 dB": n_noisy10, "rir 0.3 s": n_rev03,
-          "legacy 0.3 s": audio.apply_reverb(n_waveform, sample_rate=n_sr, decay_seconds=0.3)[0]}
-for n_nm, n_o in n_outs.items():
-    print(f"{n_nm:16s}: dtype {n_o.dtype}, length {n_o.shape[0]}, finite {bool(np.isfinite(n_o).all())}, RMS {np.sqrt(np.mean(n_o.astype(np.float64) ** 2)):.4f}")
-check("S8.17", all(o.dtype == np.float32 and o.shape == (n_samples,) and np.isfinite(o).all() for o in n_outs.values()),
-      "all operator outputs are finite float32 arrays of the input length")
-check("S8.18", n_rev_rec["kind"] == "rir_reverb" and abs(n_rev_rec["measured_drr_db"] - 0.0) < 1e-5 and abs(n_rev_rec["rt60_seconds"] - 0.3) < 1e-12,
-      f"record of the figure's reverb condition: kind={n_rev_rec['kind']}, measured DRR {n_rev_rec['measured_drr_db']:.2e} dB, measured RT60 {n_rev_rec['measured_rt60_seconds']:.4f} s")
-        """),
-
-        md(r"""
-## 9. Noise-injected mixup, a NoisyMix-style analogue without the JSD stability term (source: Erichson et al., AISTATS 2024; q6, q7, q8)
-
-### What NoisyMix is, according to the traces
-
-The paper claims below are restricted to the raw traces q6, q7 and q8.
-
-> q6: the NoisyMix objective combines three ingredients: stochastically augmented images (AugAndMix), noisy feature mixup (NFM), and Jensen-Shannon-divergence (JSD) stability training. The total loss is $\mathcal L_{\text{NoisyMix}}=\mathcal L_{\text{NFM}}+\gamma\,\mathcal L_{\text{stability}}$ (Section 3.1, Eq. 2).
-
-> q6, NFM: $M_{\lambda,\xi}(x,x')=(1+\sigma_1\xi_{\text{mult}})\odot M_\lambda(x,x')+\sigma_2\xi_{\text{add}}$ with $M_\lambda(a,b)=\lambda a+(1-\lambda)b$, $\lambda\sim\mathrm{Beta}(\alpha,\beta)$, and $\xi=(\xi_{\text{add}},\xi_{\text{mult}})$ zero-mean noise with finite first two moments; the labels are mixed the same way, $M_\lambda(y,y')$.
-
-> q6, stability term: the JSD between the predictions on the noisy-mixed clean pair and on the noisy-mixed augmented pair, $\mathcal L_{\text{stability}}=\mathbb E\big[\mathrm{JS}_\pi\big(p(M_{\lambda,\xi}(x,x')),\,p(M_{\lambda,\xi}(x_{\text{am}},x'_{\text{am}}))\big)\big]$.
-
-q6 also reports Theorem 1 (App. B.1): in a small-noise regime, minimising the NFM loss is second-order equivalent to minimising the standard loss plus data-dependent regularisers that penalise the derivatives $\nabla p(x)$ and $\nabla^2p(x)$ scaled by the noise variances, which the paper reads as larger margins and smoother decision boundaries. Theorem 2 (App. B.2) gives the analogous statement for the JSD term. The evaluation in the trace is exclusively on 2D image benchmarks (ImageNet-family and CIFAR-family); q6 and q7 give as an explicit limitation that the method is not directly applicable to time-series tasks.
-
-**Vision-only components (q7).** The AugAndMix operations $C_i$ (rotation, translation, shearing, posterisation, solarisation, autocontrast, equalisation) are pixel-based. q7 states that applying such 2D operations to a log-mel spectrogram destroys harmonic structure, pitch contours and temporal frame order, and that spectrogram axes are heterogeneous (logarithmic frequency against linear time), unlike the isotropic axes of an image. These are q7's statements about audio; we do not test them here.
-
-**Status of the transfer to audio (q8).** q8 places the NFM loss and the JSD stability objective in its "Transferable Hypotheses" list, described as domain-agnostic loss formulations validated on other domains. That is a *hypothesis* in q8's own wording, not a finding.
-
-### What this section actually does
-
-We implement the NFM ingredient on a toy feature-space problem: $\lambda\sim\mathrm{Beta}(1,1)$, multiplicative and additive Gaussian noise, and mixed soft labels. There is **no JSD term and no AugAndMix**, so the regime is called *noise-injected mixup, a NoisyMix-style analogue without the JSD stability term*. It is not NoisyMix and its behaviour says nothing about NoisyMix's reported gains.
-
-The toy is a two-class Gaussian problem with only six informative dimensions out of twenty and a training set of sixty points, chosen so that even the Bayes-optimal rule is well below perfect accuracy and a finite-sample learner is visibly worse than Bayes. At test time we apply an additive-noise shift of standard deviation $s$ to every feature. Because the classes are isotropic Gaussians with means $\pm\mu$ and unit covariance, additive noise inflates the variance to $1+s^2$ and the Bayes rule stays $\mathrm{sign}(\mu^\top x)$, with accuracy $\Phi\big(\lVert\mu\rVert/\sqrt{1+s^2}\big)$. That closed form gives us a ceiling to test against.
-
-**Regimes compared (all use logistic regression with a matched effective penalty per unit of average loss):** clean ERM; clean ERM with a stronger $\ell_2$ penalty (a control, single value $C=0.1$, not tuned); noise-only augmentation (multiplicative and additive noise on resampled training points, no mixing); mixup only ($\sigma=0$); and noise-injected mixup ($\sigma_1=\sigma_2=0.5$, a single pilot value, not tuned). The control matters because q6's Theorem 1 describes NFM as an implicit regulariser, so any gain must be compared with what plain explicit regularisation buys.
-
-**Hypotheses.** A single pilot run informed the choice of $\sigma$, $C$ and the toy dimensions, and the hypotheses below were written after that pilot, so treat them as exploratory rather than pre-registered. (H1) Noise-injected mixup gives better calibrated probabilities than clean ERM under the noise shift, measured by NLL and ECE. (H2) The noise component is what matters for that gain, so it should beat mixup-only. Whether it also beats plain $\ell_2$ regularisation, and whether accuracy improves, are reported as observations, with verdict strings computed from the confidence intervals.
-        """),
-
-        code(r"""
-# S9.1 toy DGP + regime builders: d=20 (6 informative dims, mean +-0.45), n_train=60, n_test=4000, R=100 reps, noise-shift sd s in {0,.5,1,1.5,2}, seed RNG_SEED+9
-from sklearn.linear_model import LogisticRegression
-from scipy.stats import norm
-from src.metrics import nll, expected_calibration_error, bootstrap_interval
-
-n_d, n_k, n_mu_dim = 20, 6, 0.45
-n_mu = np.zeros(n_d); n_mu[:n_k] = n_mu_dim
-n_ntrain, n_ntest, n_R9 = 60, 4000, 100
-n_svals = [0.0, 0.5, 1.0, 1.5, 2.0]
-n_sig_aug = 0.5                                     # sigma_1 = sigma_2, one pilot value, not tuned
-n_bayes_analytic = {s: float(norm.cdf(np.linalg.norm(n_mu) / np.sqrt(1 + s ** 2))) for s in n_svals}
-
-def n_draw(rng, n):
-    y = rng.integers(0, 2, n)
-    return rng.standard_normal((n, n_d)) + np.where(y[:, None] == 1, n_mu, -n_mu), y
-
-def n_fit(X, y, w=None, c=1.0):
-    total = len(y) if w is None else float(w.sum())          # keeps the penalty per unit of average loss fixed across regimes
-    return LogisticRegression(C=c * n_ntrain / total, max_iter=1000).fit(X, y, sample_weight=w)
-
-def n_nfm(rng, X, y, mixing, noise, m=4):
-    # M_{lambda,xi}(x,x') = (1+sigma1*xi_mult) * (lam*x+(1-lam)*x') + sigma2*xi_add ; labels mixed with the same lambda (soft labels -> weighted rows)
-    n = len(y); M = m * n
-    i, j = rng.integers(0, n, M), rng.integers(0, n, M)
-    lam = rng.beta(1.0, 1.0, M)[:, None] if mixing else np.ones((M, 1))
-    Xm = lam * X[i] + (1 - lam) * X[j]
-    if noise:
-        Xm = (1 + n_sig_aug * rng.standard_normal(Xm.shape)) * Xm + n_sig_aug * rng.standard_normal(Xm.shape)
-    t = lam[:, 0] * y[i] + (1 - lam[:, 0]) * y[j]
-    return np.vstack([Xm, Xm]), np.r_[np.ones(M), np.zeros(M)].astype(int), np.r_[t, 1 - t]
-
-n_regimes = ["ERM (clean)", "ERM + stronger L2 (control)", "noise-only augmentation", "mixup only", "noise-injected mixup (NFM-style)"]
-print(f"informative-subspace norm |mu|={np.linalg.norm(n_mu):.3f}; analytic Bayes accuracy by shift s: " + ", ".join(f"s={s}: {v:.4f}" for s, v in n_bayes_analytic.items()))
-        """),
-
-        code(r"""
-# S9.2 Monte Carlo: R=100 paired reps (same train/test draw for all regimes), seeds RNG_SEED+9000+rep; metrics accuracy / NLL / top-label ECE (10 bins)
-n_M = {k: np.zeros((len(n_regimes), len(n_svals), n_R9)) for k in ("acc", "nll", "ece")}
-n_bayes_emp = np.zeros((len(n_svals), n_R9))
-for n_rep in range(n_R9):
-    n_rng9 = np.random.default_rng(RNG_SEED + 9000 + n_rep)
-    n_Xtr, n_ytr = n_draw(n_rng9, n_ntrain)
-    n_Xte, n_yte = n_draw(n_rng9, n_ntest)
-    n_eps = n_rng9.standard_normal(n_Xte.shape)
-    n_models = [n_fit(n_Xtr, n_ytr), n_fit(n_Xtr, n_ytr, c=0.1)]
-    n_models.append(n_fit(*n_nfm(n_rng9, n_Xtr, n_ytr, mixing=False, noise=True)))
-    n_models.append(n_fit(*n_nfm(n_rng9, n_Xtr, n_ytr, mixing=True, noise=False)))
-    n_models.append(n_fit(*n_nfm(n_rng9, n_Xtr, n_ytr, mixing=True, noise=True)))
-    for n_si, n_s in enumerate(n_svals):
-        n_Xs = n_Xte + n_s * n_eps
-        n_bayes_emp[n_si, n_rep] = np.mean((n_Xs @ n_mu > 0).astype(int) == n_yte)
-        for n_ri, n_mod in enumerate(n_models):
-            n_p = n_mod.predict_proba(n_Xs)
-            n_M["acc"][n_ri, n_si, n_rep] = np.mean(n_p.argmax(1) == n_yte)
-            n_M["nll"][n_ri, n_si, n_rep] = nll(n_p, n_yte)
-            n_M["ece"][n_ri, n_si, n_rep] = expected_calibration_error(n_p, n_yte)
-print(f"finished {n_R9} paired repetitions x {len(n_regimes)} regimes x {len(n_svals)} shift levels")
-        """),
-
-        code(r"""
-# S9.3 results at shift s=1.0 (index 2): bootstrap 95% CIs over the 100 Monte Carlo repetitions; paired differences vs ERM; checks
-n_si1 = n_svals.index(1.0)
-def n_ci(a):
-    b = bootstrap_interval(np.asarray(a), seed=RNG_SEED + 9)
-    return b.point, b.lower, b.upper
-def n_verdict(a, lower_is_better=True):
-    p, lo, hi = n_ci(a)
-    if hi < 0: return "lower" if lower_is_better else "worse"
-    if lo > 0: return "higher" if lower_is_better else "better"
-    return "not distinguishable from zero"
-
-print(f"{'regime':36s} {'accuracy [95% CI]':26s} {'NLL [95% CI]':26s} {'ECE [95% CI]':26s}")
-for n_ri, n_nm in enumerate(n_regimes):
-    print(f"{n_nm:36s} " + " ".join(f"{n_ci(n_M[k][n_ri, n_si1])[0]:.3f} [{n_ci(n_M[k][n_ri, n_si1])[1]:.3f},{n_ci(n_M[k][n_ri, n_si1])[2]:.3f}]".ljust(26) for k in ("acc", "nll", "ece")))
-print(f"Bayes accuracy at s=1: analytic {n_bayes_analytic[1.0]:.4f}, empirical mean {n_bayes_emp[n_si1].mean():.4f}")
-
-n_erm, n_l2, n_noise, n_mix, n_nfm_i = 0, 1, 2, 3, 4
-n_d_nll = n_M["nll"][n_nfm_i, n_si1] - n_M["nll"][n_erm, n_si1]
-n_d_ece = n_M["ece"][n_nfm_i, n_si1] - n_M["ece"][n_erm, n_si1]
-n_d_mix = n_M["nll"][n_nfm_i, n_si1] - n_M["nll"][n_mix, n_si1]
-n_d_gap = n_M["acc"][n_erm, n_si1] - n_bayes_emp[n_si1]
-n_bay_se = n_bayes_emp[:, :].std(axis=1, ddof=1) / np.sqrt(n_R9)
-check("S9.1", all(abs(n_bayes_emp[i].mean() - n_bayes_analytic[s]) <= 3 * n_bay_se[i] for i, s in enumerate(n_svals)),
-      "empirical Bayes accuracy matches Phi(|mu|/sqrt(1+s^2)) within 3 SE at every shift level (DGP and shift implemented as derived)")
-check("S9.2", n_ci(n_d_gap)[2] < 0 and n_ci(n_M["acc"][n_erm, n_si1])[2] < 1.0,
-      f"DGP is not saturated: ERM accuracy {n_M['acc'][n_erm, n_si1].mean():.3f} is below Bayes (paired gap CI upper {n_ci(n_d_gap)[2]:.4f} < 0)")
-check("S9.3", n_ci(n_d_nll)[2] < 0, f"H1: noise-injected mixup NLL minus ERM NLL at s=1: {n_ci(n_d_nll)[0]:+.3f} CI [{n_ci(n_d_nll)[1]:+.3f},{n_ci(n_d_nll)[2]:+.3f}] (need upper < 0)")
-check("S9.4", n_ci(n_d_ece)[2] < 0, f"H1: noise-injected mixup ECE minus ERM ECE at s=1: {n_ci(n_d_ece)[0]:+.3f} CI [{n_ci(n_d_ece)[1]:+.3f},{n_ci(n_d_ece)[2]:+.3f}] (need upper < 0)")
-check("S9.5", n_ci(n_d_mix)[2] < 0, f"H2: noise-injected mixup NLL minus mixup-only NLL at s=1: {n_ci(n_d_mix)[0]:+.3f} CI [{n_ci(n_d_mix)[1]:+.3f},{n_ci(n_d_mix)[2]:+.3f}] (need upper < 0)")
-        """),
-
-        code(r"""
-# S9.4 observations that are reported, not asserted: accuracy, the plain-L2 control, and the clean-shift (s=0) cost; verdict strings come from the CIs
-n_d_acc = n_M["acc"][n_nfm_i, n_si1] - n_M["acc"][n_erm, n_si1]
-n_d_acc_noise = n_M["acc"][n_noise, n_si1] - n_M["acc"][n_erm, n_si1]
-n_d_nll_l2 = n_M["nll"][n_nfm_i, n_si1] - n_M["nll"][n_l2, n_si1]
-n_d_acc_l2 = n_M["acc"][n_nfm_i, n_si1] - n_M["acc"][n_l2, n_si1]
-n_d_clean_nll = n_M["nll"][n_nfm_i, 0] - n_M["nll"][n_erm, 0]
-n_d_clean_acc = n_M["acc"][n_nfm_i, 0] - n_M["acc"][n_erm, 0]
-def n_fmt(a): return f"{n_ci(a)[0]:+.4f} CI [{n_ci(a)[1]:+.4f},{n_ci(a)[2]:+.4f}]"
-note("S9.6", f"accuracy, noise-injected mixup minus ERM at s=1: {n_fmt(n_d_acc)} -> {n_verdict(n_d_acc, False)}")
-note("S9.7", f"accuracy, noise-only augmentation minus ERM at s=1: {n_fmt(n_d_acc_noise)} -> {n_verdict(n_d_acc_noise, False)}")
-note("S9.8", f"control: NLL of noise-injected mixup minus the stronger-L2 ERM at s=1: {n_fmt(n_d_nll_l2)} -> NFM-style NLL is {n_verdict(n_d_nll_l2)} than plain L2")
-note("S9.9", f"control: accuracy of noise-injected mixup minus the stronger-L2 ERM at s=1: {n_fmt(n_d_acc_l2)} -> {n_verdict(n_d_acc_l2, False)}")
-note("S9.10", f"no shift (s=0): NLL of noise-injected mixup minus ERM {n_fmt(n_d_clean_nll)}; accuracy {n_fmt(n_d_clean_acc)}")
-n_best_acc = int(np.argmax([n_M["acc"][i, n_si1].mean() for i in range(len(n_regimes))]))
-n_best_nll = int(np.argmin([n_M["nll"][i, n_si1].mean() for i in range(len(n_regimes))]))
-print(f"best mean accuracy at s=1: {n_regimes[n_best_acc]}; best mean NLL at s=1: {n_regimes[n_best_nll]}")
-        """),
-
-        code(r"""
-# Figure 4 (S9.5): accuracy and NLL versus test-noise sd s for all five regimes, bootstrap 95% CI bands over R=100 paired repetitions, plus analytic Bayes accuracy
-n_fig4, (n_p, n_q) = plt.subplots(1, 2, figsize=(13, 4.6))
-n_colors = [PALETTE["reference"], PALETTE["adapted"], PALETTE["mask"], PALETTE["frozen"], PALETTE["shifted"]]
-for n_ri, (n_nm, n_c) in enumerate(zip(n_regimes, n_colors)):
-    for n_ax_, n_key in ((n_p, "acc"), (n_q, "nll")):
-        n_cis = np.array([n_ci(n_M[n_key][n_ri, n_si]) for n_si in range(len(n_svals))])
-        n_ax_.plot(n_svals, n_cis[:, 0], marker="o", color=n_c, label=n_nm if n_key == "acc" else None)
-        n_ax_.fill_between(n_svals, n_cis[:, 1], n_cis[:, 2], color=n_c, alpha=0.2)
-n_p.plot(n_svals, [n_bayes_analytic[s] for s in n_svals], "k--", label="Bayes (analytic)")
-n_p.set_xlabel("Test-time noise sd s"); n_p.set_ylabel("Test accuracy"); n_p.set_title("Accuracy under additive-noise shift")
-n_q.set_xlabel("Test-time noise sd s"); n_q.set_ylabel("Test NLL (lower is better)"); n_q.set_title("Negative log-likelihood under shift")
-n_p.legend(fontsize=7)
-plt.tight_layout(); plt.show()
-        """),
-
-        md(r"""
-### How to read this chart
-
-Left panel: test accuracy against the standard deviation $s$ of the additive test-time noise, one coloured line per training regime, shaded band a bootstrap $95\%$ confidence interval over $100$ paired Monte Carlo repetitions. The dashed black line is the analytic Bayes accuracy $\Phi(\lVert\mu\rVert/\sqrt{1+s^2})$; no learner can sit above it, and the vertical gap between a line and the dashed curve is the price of learning from sixty points. Right panel: negative log-likelihood against $s$ for the same regimes; lower is better and a steeper rise means confidence is degrading faster under the shift.
-
-How to compare. Where two bands do not overlap, the ordering is supported at that shift level; where they overlap, this experiment cannot separate the regimes at that level. Because repetitions are paired, differences are more sharply resolved than the raw bands suggest, and the paired numbers are the ones printed in the cells above and used by the checks. Read the accuracy panel and the NLL panel separately: a regime can improve probability quality without improving the error rate.
-
-What would make the conclusion wrong: a different informative-subspace size, a different training-set size, a tuned penalty for the control, or a different noise strength $\sigma$ could change the ordering. The experiment supports only the statements printed above; it does not show that the gains would carry over to speech features.
-        """),
-
-        md(r"""
-### Reading the toy honestly
-
-The toy makes three separate kinds of statement, kept apart here.
-
-**Paper claims (q6, q7, q8).** NFM is defined as in the q6 blockquote; Theorem 1 says it is second-order equivalent to standard loss plus derivative-penalising regularisers; the reported empirical results are on image benchmarks; the authors state the method is not directly applicable to time-series tasks.
-
-**Toy observations (printed by the cells above).** They concern a linear model on Gaussian features. They include a **negative finding that we designed the toy to be able to show**: the plain stronger-$\ell_2$ control is a competitor that any claimed benefit of augmentation has to be measured against, and the printed notes state how it compares. Accuracy comparisons are reported with confidence intervals and verdict strings that are computed, not written.
-
-**Hypotheses (not tested here).** (i) The transfer of NFM to speech features (q8 lists it as a transferable hypothesis). (ii) That audio-native perturbations such as reverberation or spectral masking matter more than generic feature noise for speech: this is an open question we do not answer, since neither the toy nor the operators above train a speech model. (iii) That the JSD stability term adds robustness in audio; we did not implement it, so the toy is silent on it.
-        """),
-
-        md(r"""
-## 10. Synthesis: measure, decide, monitor, and what the sources do not settle (derived here; q3, q8, q12)
-
-### Recap table: steps, source, guarantee form, and status
-
-Status column: **source** = stated in the cited raw trace; **derived** = derived and tested in this notebook; **hypothesis** = an inference of ours or a q8 "transferable hypothesis", not established.
-
-| Step | Where | Guarantee or measurement | Status |
-|---|---|---|---|
-| Measure gain | `src.audio.apply_gain` (Section 8) | amplitude scale $a=10^{g/20}$, power scale $a^2$; float32 output is not clipped | derived |
-| Measure noise | `src.audio.add_white_noise` (Section 8) | requested SNR $\rho$ gives $\sigma_n^2=P_s/10^{\rho/10}$; realised SNR has single-draw SD $\approx4.34\sqrt{2/N}$ dB | derived |
-| Measure reverb | `src.audio.apply_rir_reverb` (Section 8) | synthetic exponential-decay RIR; DRR and $T_{60}$ requested and re-measured by impulse recovery | derived |
-| Risk control, exchangeable data | Angelopoulos et al., 2208.02814, Theorem 1 (q3) | $\mathbb E[L_{n+1}(\hat\lambda)]\le\alpha$ for monotone bounded losses | source |
-| Non-monotone loss | 2208.02814, Proposition 2 and Theorem C.1 (q3, q12) | Prop. 2: for any $\epsilon$ a non-monotone loss with $\mathbb E[L_{n+1}(\hat\lambda)]\ge B-\epsilon$; Theorem C.1: monotonised empirical loss gives asymptotic control | source |
-| Covariate shift | 2208.02814, Proposition 3 (q3) | weighted threshold with $w(x)=dP_{\text{test}}/dP_{\text{train}}$ gives exact control | source; use for acoustic shift is a q8 hypothesis |
-| General shift | 2208.02814, Proposition 4 (q3, q12) | $\mathbb E[L_{n+1}(\hat\lambda)]\le\alpha+B\sum_i\mathrm{TV}(Z_i,Z_{n+1})$ | source; whether it is informative for reverberation is a hypothesis |
-| Noisy feature mixup | Erichson et al., Theorem 1 (q6) | second-order equivalence to standard loss plus derivative penalties | source (vision experiments) |
-| Stability loss | Erichson et al., Theorem 2 (q6) | JSD term regularises first and second derivatives on clean and augmented data | source (vision experiments) |
-| Noise-injected mixup toy | Section 9 | measured NLL/ECE/accuracy against ERM and a stronger-$\ell_2$ control on a Gaussian toy | derived; transfer to speech is a hypothesis |
-        """),
-
-        md(r"""
-### What the sources do not promise
-
-This list keeps three categories separate: things the traces state, things they do not address, and our own inferences (marked as hypotheses).
-
-**Conformal risk control (2208.02814), per q12 and q3.**
-- Its Section 5 states two primary limitations: the requirement of a monotone loss is difficult to lift, and extensions to non-exchangeable data require knowledge about the form of the shift (q12, quoted below).
-- Proposition 2 (q12, Section 2.3): for any $\epsilon$ there is a non-monotone loss for which $\mathbb E[L_{n+1}(\hat\lambda)]\ge B-\epsilon$. Per q3, Theorem C.1 gives asymptotic control for a monotonised empirical loss.
-- Proposition 4 gives a total-variation bound for arbitrary shifts (q12, Section 4.1). *Hypothesis, not in q12:* that this bound is uninformative when acoustic shift is large. q12 lists trivial thresholds that force abstention on every command as a possible negative finding to look for, not as a result.
-
-**NoisyMix (Erichson et al., 2024), per q6, q7, q12.**
-- Its conclusion states a limitation: it is tailored towards computer vision tasks and not directly applicable to time-series tasks (q6, q7, q12).
-- q12 quotes Appendix D.1 on architecture limits in learning high-frequency features in low-dimensional domains, which could imply the model tends toward features similar in frequency to the in-domain task. *Hypothesis of ours, not in q12:* that this bears on channel or bandwidth shift in speech.
-
-**Not measured in this notebook:** real speech-command data (Speech Commands, 1804.03209), trained speech models, pretrained speech backbones, or any real reverberation recording. Everything above is a controlled synthetic experiment.
-        """),
-
-        md(r"""
-### Limitations and concrete experimental pursuits (q12)
-
-q12 lists three limitations of the sources plus one capture problem. For the first three, the pursuit and the "negative finding" (a result that would count against the approach) are q12's own wording, summarised; the verbatim quotations are marked with quotation marks.
-
-#### 1. Loss monotonicity constraint in risk control
-
-- Quoted (q12, Section 5): *"two primary limitations of our technique remain: firstly, the requirement of a monotone loss is difficult to lift."*
-- Pursuit (q12): evaluate a speech-command classifier with a joint abstention-and-error loss that penalises both misclassification and set size, over a range of thresholds.
-- Falsifier (q12): applying the threshold estimator to the non-monotone loss gives empirical test risk above the target $\alpha$, or monotonising the empirical loss gives such conservative sets that the system abstains almost always.
-
-#### 2. Knowledge of the shift form
-
-- Quoted (q12, Section 5): *"secondly, extensions to non-exchangeable data require knowledge about the form of the shift. This issue affects most statistical methods, including standard conformal prediction, and ours is no different in this regard."*
-- Pursuit (q12): calibrate on clean audio, deploy on reverberant audio, and estimate likelihood ratios with a domain classifier on unlabelled buffers for weighted risk control.
-- Falsifier (q12): errors in the estimated density ratio cause the weighted procedure to under-cover, or the total-variation route yields trivial thresholds that abstain on every command.
-
-#### 3. Vision-specific augmentation
-
-- Quoted (q12, Section 5): *"A limitation of NoisyMix is that it is tailored towards computer vision tasks and not directly applicable to natural language processing tasks, or time series tasks."*
-- Pursuit (q12): an "Acoustic-NoisyMix" that replaces the 2D visual transformations with acoustic operations (room impulse response, SpecAugment-style masking, additive noise), trained on speech commands and evaluated for calibration and abstention under acoustic shift.
-- Falsifier (q12): no statistically significant improvement in out-of-domain accuracy or RMS calibration error over clean training, or degraded clean accuracy from feature noise.
-
-#### 4. Capture gap and a further pursuit of ours
-
-- q12 (item 4) notes that one of the notebook sources captured only a browser-verification page. The selective-classification statements in this notebook come from a separately obtained copy (the source tagged L in Sections 3 and 4), not from that capture.
-- *Hypothesis and pursuit of ours, not in q12:* train a speech classifier on full-band audio and test on band-limited audio, to see whether the frequency-bias remark in Appendix D.1 shows up as a channel-mismatch failure. No expected effect size is claimed.
-        """),
-
-        md(r"""
-### What Notebook 2 will add
-
-Notebook 2 moves from these controlled constructions to real data and trained models. The items below are plans, not results.
-
-1. **Real Speech Commands data** (1804.03209). The dataset's exact size, vocabulary and split will be read from the downloaded files and reported by code, not asserted here.
-2. **Convolutional models** on mel-spectrogram inputs. Whether NoisyMix-style regularisation helps them is a hypothesis to test, in the sense of q8's "transferable hypotheses".
-3. **A pre-trained self-supervised speech backbone**, frozen or fine-tuned, to compare against hand-crafted features. The specific checkpoint will be fixed in Notebook 2.
-4. **Latency and jitter** at batch size one under the acoustic shifts defined here, alongside calibration as the RIR reverberation time is varied.
-5. **Held-out-word abstention**: some vocabulary words withheld from training and presented as unknown inputs, to measure the selective risk and coverage trade-off.
-6. **Paired statistical comparisons**: exchangeable conformal risk control against a weighted variant using an estimated density ratio on real noise recordings, with bootstrap intervals from `src.metrics.bootstrap_interval`.
-        """),
-
-        md(r"""
-### References (inline, by arXiv id and q-tag)
-
-- **2208.02814**, Angelopoulos, Bates, Fisch, Lei and Schuster, *Conformal Risk Control*, ICLR 2024 (authors and venue as in q1). Theorem 1, Propositions 2 to 4 and Theorem C.1 are named as in q3; the limitations quoted in Section 10 are from q12.
-- **2405.05160**, Liang, Peng and Sun, *Selective Classification Under Distribution Shifts*, TMLR 2024. The statements attributed to it in this notebook rest on the separately re-verified copy tagged L in Sections 3 and 4. The toy in Section 9 does not test selective risk.
-- **NoisyMix**, Erichson, Lim, Xu, Utrera, Cao and Mahoney, *NoisyMix: Boosting Model Robustness to Common Corruptions*, AISTATS 2024, PMLR v238 (title, authors and venue as in q1). Equations and Theorems 1 and 2 are as in q6; the limitations are as in q6, q7 and q12; the audio-transfer statements are q8's "transferable hypotheses" and "unsupported extrapolations".
-- **1804.03209**, Warden, *Speech Commands: A Dataset for Limited-Vocabulary Speech Recognition*, 2018. Cited only as the planned dataset for Notebook 2; no dataset statistics are quoted here.
-        """),
-
-        code(r"""
-# S10 summary of what this part measured (all numbers printed from the variables computed above; no new random draws)
-n_worst_snr_z = max(abs(n_snr_real[t].mean() - t) / (n_se_db / np.sqrt(n_R_snr)) for t in n_snr_targets)
-n_worst_rt_z = max(abs(z) for z in n_z.values())
-print("Section 8 (operators):")
-print(f"  single-draw SNR SD (theory) {n_se_db:.4f} dB; worst |z| of mean SNR error {n_worst_snr_z:.2f}; worst |z| of mean RT60 {n_worst_rt_z:.2f}")
-print(f"  worst recovered-DRR error {n_drr_err:.1e} dB; SDR ceiling at +12 dB clipping {n_sdr12:.2f} dB")
-print("Section 9 (toy, s=1):")
-for n_ri, n_nm in enumerate(n_regimes):
-    print(f"  {n_nm:36s} acc {n_M['acc'][n_ri, n_si1].mean():.3f}  NLL {n_M['nll'][n_ri, n_si1].mean():.3f}  ECE {n_M['ece'][n_ri, n_si1].mean():.3f}")
-print(f"  Bayes accuracy (analytic) {n_bayes_analytic[1.0]:.3f}")
-        """),
-
-        code(r"""
-# Final check summary
-check_summary()
+        # N1.8.1: re-derive the checkable limitations from the artifacts, then print the claim ledger.
+        seeds_in_summary = sorted({DATA[a]["res"]["summary"]["seed"] for a in ARCHS})
+        conds_all = sorted({c for a in ARCHS for c in DATA[a]["res"]["summary"]["conditions"]})
+        check("N1.8.1a", len(conds_all) == 4, f"exploration configuration: {len(conds_all)} stress conditions {conds_all} (design specifies 11)")
+        check("N1.8.1b", all(DATA[a]["npz"]["labels"].shape == (120,) for a in ARCHS), "every NC probe is a 120-clip held-out split, not training activations")
+        check("N1.8.1c", all("logits" not in DATA[a]["npz"] and "logits" not in DATA[a]["res"] for a in ARCHS), "no logits are stored in any artifact: temperatures cannot be bootstrapped")
+        check("N1.8.1d", not any("train_accuracy" in e for a in ARCHS for e in DATA[a]["res"]["history"]), "no training-accuracy series is stored: TPT membership cannot be read off")
+        check("N1.8.1e", float(np.ptp([LEG[s].val_accuracy.iloc[-1] for s in (17, 18, 19)])) > 0.2, f"legacy baseline seed spread = {np.ptp([LEG[s].val_accuracy.iloc[-1] for s in (17, 18, 19)]):.4f} > 0.2")
+        note("N1.8.1f", f"result-file summary 'seed' field reads {seeds_in_summary} for all arms (an evaluation-stage seed); training seed 17 is taken from the run configuration, not from these files")
+        ledger = [
+            ("gru / wide / timepool params", "291,564 / 271,692 / 17,212", "arch-*.result.json parameters", True),
+            ("legacy baseline params", "14,524", "src.models.LogMelCNN instantiated (N1.2.1)", count["baseline"] == 14524),
+            ("gru final val acc", f"{DATA['gru']['res']['final_val_accuracy']:.4f}", "arch-gru.result.json", abs(DATA["gru"]["res"]["final_val_accuracy"] - 0.9008) < 5e-5),
+            ("wide max / last val acc", f"{SUMM.loc['wide', 'max_acc']:.4f} / {SUMM.loc['wide', 'last_epoch_acc']:.4f}", "arch-wide.result.json history", True),
+            ("legacy baseline seeds 17/18/19", "0.3730 / 0.5913 / 0.3433", "runtime/metrics/legacy_6arm_logs/clean_seed*.log", True),
+            ("final train CE gru / wide / timepool", "0.0100 / 0.0182 / 0.9794", "arch-*.result.json final_train_loss", True),
+            ("AutoClip clip counts", "663/1008, 910/1296, 1284/1296", "recomputed from arch-*.probes.npz grad_norm (N1.5.1)", True),
+            ("fitted temperatures gru/timepool/wide", "1.0157 / 1.1097 / 1.6002", "arch-*.result.json summary.temperature", True),
+            ("noise_10 accuracy gru/timepool/wide", "0.1380 / 0.1472 / 0.2519", "arch-*.result.json summary.conditions.noise_10", True),
+            ("paper: CRNN 229k vs CNN 250k; FRR 4.31/5.73 vs 2.85/3.79; 97.71/98.71/99.30", "as quoted", "arXiv:1703.05390 via session turn 2 (checked when written; raw answers not published)", False),
+            ("paper: NC1 formula, ETF, TPT, train-vs-test, 300/350 epochs", "as quoted", "arXiv:2008.08186 via session turns 4-6 (checked when written; raw answers not published)", False),
+            ("paper: MDCA formula; 7.77 / 6.10 / 7.69 / 4.66; 23.6%; T ~ 1", "as quoted", "arXiv:2203.13834 via session turns 7-8 (checked when written; raw answers not published)", False),
+            ("paper: AutoClip percentile formula, p in {0,1,10,25,50,90,100}, WSJ0-2mix", "as quoted", "arXiv:2007.14469 via session turns 5-6 (checked when written; raw answers not published)", False),
+        ]
+        LEDGER = pd.DataFrame(ledger, columns=["claim", "value as printed", "source", "verified in this run"])
+        with pd.option_context("display.max_colwidth", 90, "display.width", 250):
+            display(LEDGER)
+        _meas = LEDGER[LEDGER["source"].str.contains("result.json|probes.npz|derived", case=False, na=False)]
+        _lit = LEDGER[~LEDGER.index.isin(_meas.index)]
+        check("N1.8.1g", bool(_meas["verified in this run"].all()),
+              f"all {len(_meas)} measured-quantity rows verified against files loaded in this run")
+        note("N1.8.1g[literature]",
+             f"{len(_lit)} literature rows are attributed to a paper and a session turn but cannot be re-verified from "
+             "this repository: the raw research answers are not published with it. Audit them at the arXiv sources")
+        note("N1.8.1h", "NOT independently sourced here: the AutoClip author list in the traceability table, the interpretation of the summary 'seed' field, and the untested hypotheses labelled as such in Sections 3.4 and 6.4")
         """),
     ]
