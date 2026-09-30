@@ -29,6 +29,7 @@ class ExperimentConfig:
     patience: int = 2
     microbatch_size: int = 64
     accumulation_steps: int = 2
+    autoclip_percentile: float = 10.0
 
     def __post_init__(self) -> None:
         if self.condition not in TRAINING_CONDITIONS:
@@ -39,6 +40,10 @@ class ExperimentConfig:
                 raise ValueError(f"{name} must be a positive integer")
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
             raise ValueError("seed must be an integer")
+        if not isinstance(self.autoclip_percentile, (int, float)) or isinstance(self.autoclip_percentile, bool):
+            raise ValueError("autoclip_percentile must be a number")
+        if self.autoclip_percentile <= 0 or self.autoclip_percentile > 100:
+            raise ValueError("autoclip_percentile must be > 0 and <= 100")
 
     @property
     def optimization_budget(self) -> tuple[int, int, int, int]:

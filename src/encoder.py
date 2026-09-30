@@ -82,11 +82,12 @@ def extract_hidden(
         ValueError: If layer_index is beyond available layers.
     """
     outputs = []
+    device = next(encoder.parameters()).device
 
     with torch.no_grad():
         for start in range(0, len(waveforms), batch_size):
             end = min(start + batch_size, len(waveforms))
-            batch = waveforms[start:end]
+            batch = waveforms[start:end].to(device)
 
             # encoder.extract_features returns (layers_list, lengths)
             layers, lengths = encoder.extract_features(batch)

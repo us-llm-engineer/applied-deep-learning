@@ -48,7 +48,7 @@ class ArmRun:
         ids_test: identifiers of the test clips, aligned with the rows of logits_test.
         train: epochs_run, best_epoch (0-based), optimizer_steps, wall_seconds of training.
         resources: parameters, model_size_bytes, latency_cpu_median_ms (batch-1 CPU),
-            peak_memory_mb (always 0.0: CPU only), device.
+            peak_memory_mb (real CUDA measurement when device is a CUDA device, else 0.0), device.
     """
     condition: str
     seed: int
@@ -74,6 +74,23 @@ def _features(waveforms: np.ndarray) -> np.ndarray:
     return np.concatenate(chunks, axis=0)
 
 
+def _feature_stats(features: np.ndarray) -> tuple[float, float]:
+    """Global mean/std of a log-mel feature array, for input normalization.
+
+    Global (whole-array) rather than per-utterance on purpose: per-utterance normalization
+    divides out each clip's overall level, which would make the gain_* stress conditions
+    trivially invariant and silently nullify three of the eleven conditions this study measures.
+    """
+    mean = float(np.mean(features))
+    std = float(np.std(features))
+    return mean, (std if std > 0.0 else 1.0)
+
+
+def _normalize(features: np.ndarray, mean: float, std: float) -> np.ndarray:
+    """Standardize log-mel features by precomputed statistics (train-split only: no leakage)."""
+    return ((np.asarray(features, dtype=np.float32) - mean) / std).astype(np.float32)
+
+
 def _masking_augment() -> Callable:
     """Training-only augment_fn: spec_mask on every log-mel example of the batch.
 
@@ -88,7 +105,7 @@ def _masking_augment() -> Callable:
     return augment
 
 
-def _acoustic_augment(seed: int) -> Callable:
+def _acoustic_augment(seed: int, mean: float = 0.0, std: float = 1.0) -> Callable:
     """Training-only augment_fn: takes a batch of float waveforms, returns their log-mel features.
 
     apply_condition("acoustic") draws a fresh random gain / white-noise / reverb per
@@ -101,7 +118,7 @@ def _acoustic_augment(seed: int) -> Callable:
     def augment(waveforms: np.ndarray, _condition: str, _rng: np.random.Generator) -> np.ndarray:
         rng = np.random.default_rng((seed, calls[0]))
         calls[0] += 1
-        return _features(apply_condition(waveforms, "acoustic", rng))
+        return _normalize(_features(apply_condition(waveforms, "acoustic", rng)), mean, std)
     return augment
 
 
@@ -114,6 +131,9 @@ def run_arm(
     stress_names: tuple[str, ...],
     latency_repeats: int = 1,
     model_factory: Optional[Callable[[], nn.Module]] = None,
+    device: str = "cpu",
+    checkpoint_path: Optional[str] = None,
+    probe_fn=None,
 ) -> ArmRun:
     """Train one model on the train split and predict cal, stressed test and stressed OOD.
 
@@ -136,6 +156,12 @@ def run_arm(
         stress_names: names from src.stress.STRESS_CONDITIONS to evaluate on test and OOD.
         latency_repeats: repeats for the batch-1 CPU latency measurement.
         model_factory: zero-argument callable building a fresh model (default LogMelCNN).
+        device: device to train on (default 'cpu', can be 'cuda' or 'cuda:0' etc.).
+        probe_fn: optional per-epoch probe forwarded to train_classifier; whatever it returns
+            lands in ArmRun.train["probe_history"]. See src.diagnostics for the probes.
+        checkpoint_path: if given, the trained model's state_dict is saved there via torch.save
+            (after training, before prediction) -- the checkpoint is not loaded back or used by
+            run_arm itself, it is purely a side-effect for external reuse.
 
     Returns:
         ArmRun (see its docstring).
@@ -143,32 +169,47 @@ def run_arm(
     if condition not in ("clean", "masking", "acoustic"):
         raise ValueError(f"unknown condition {condition!r}")
     model_factory = model_factory or LogMelCNN
+    device_obj = torch.device(device)
+    is_cuda = device_obj.type == "cuda"
     splits = bundle.splits
 
     torch.manual_seed(seed)  # model initialisation; train_classifier reseeds for shuffling
 
     train_waves = _to_float(splits["train"].waveforms)
-    val_x = _features(_to_float(splits["val"].waveforms))
-    cal_x = _features(_to_float(splits["cal"].waveforms))
+    train_feats = _features(train_waves)
+    # Normalization statistics come from the train split only -- never from val/cal/test/ood.
+    feat_mean, feat_std = _feature_stats(train_feats)
+
+    val_x = _normalize(_features(_to_float(splits["val"].waveforms)), feat_mean, feat_std)
+    cal_x = _normalize(_features(_to_float(splits["cal"].waveforms)), feat_mean, feat_std)
 
     if condition == "acoustic":
-        train_x, augment_fn = train_waves, _acoustic_augment(seed)
+        train_x, augment_fn = train_waves, _acoustic_augment(seed, feat_mean, feat_std)
     else:
-        train_x = _features(train_waves)
+        train_x = _normalize(train_feats, feat_mean, feat_std)
         augment_fn = _masking_augment() if condition == "masking" else None
 
+    if is_cuda:
+        torch.cuda.reset_peak_memory_stats(device_obj)
+
     train_result = train_classifier(
-        model_factory(), train_x, splits["train"].y, val_x, splits["val"].y, config,
-        augment_fn=augment_fn,
+        model_factory().to(device_obj), train_x, splits["train"].y, val_x, splits["val"].y, config,
+        augment_fn=augment_fn, probe_fn=probe_fn,
     )
     model = train_result.model
+    peak_memory_mb = (torch.cuda.max_memory_allocated(device_obj) / (1024 ** 2)) if is_cuda else 0.0
+
+    if checkpoint_path is not None:
+        torch.save(model.state_dict(), checkpoint_path)
 
     logits_cal = predict_logits(model, cal_x)
 
     def stressed_logits(split: str) -> dict[str, np.ndarray]:
         waves = _to_float(splits[split].waveforms)
         return {
-            name: predict_logits(model, _features(apply_stress(waves, name, seed=seed)[0]))
+            name: predict_logits(
+                model, _normalize(_features(apply_stress(waves, name, seed=seed)[0]), feat_mean, feat_std)
+            )
             for name in stress_names
         }
 
@@ -190,12 +231,19 @@ def run_arm(
             "best_epoch": train_result.best_epoch,
             "optimizer_steps": train_result.optimizer_steps,
             "wall_seconds": train_result.wall_seconds,
+            "history": train_result.history,
+            "grad_norm_history": train_result.grad_norm_history,
+            "clip_threshold_history": train_result.clip_threshold_history,
+            "inter_cluster_distance_history": train_result.inter_cluster_distance_history,
+            "intra_cluster_variance_history": train_result.intra_cluster_variance_history,
+            "instability_alert_epoch": train_result.instability_alert_epoch,
+            "probe_history": train_result.probe_history,
         },
         resources={
             "parameters": count_parameters(model),
             "model_size_bytes": model_size_bytes(model),
             "latency_cpu_median_ms": latency.median_ms,
-            "peak_memory_mb": 0.0,  # CPU-only run: no GPU memory is measured here
+            "peak_memory_mb": peak_memory_mb,
             "device": latency.device,
         },
     )
